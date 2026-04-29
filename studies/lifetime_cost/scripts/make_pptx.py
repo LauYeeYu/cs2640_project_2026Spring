@@ -58,6 +58,8 @@ EFFORT = {
     "benchmarks":        "3",                             # SWE-bench Lite, τ-bench, long-doc
     "input_tokens":      "500M+",                         # local: 297M
     "phases":            "25+",                           # local: 20
+    "api_cost":          "$200+",                         # local Haiku: ~$98
+    "gpu_hours":         "100+",                          # rough total across Blackwell + SEAS + Modal
     "compute_summary":   "Anthropic Claude Haiku 4.5 (API)  ·  Qwen3-30B-A3B on Blackwell + SEAS cluster + Modal",
 }
 
@@ -261,28 +263,30 @@ def slide_effort(prs, *, slide_num):
              "Six months of compaction experiments, in numbers.",
              size=22, bold=True, color=WHITE, font=HEAD_FONT)
 
-    # Big stat callouts in a 2 x 3 grid
+    # Big stat callouts in a 2 x 4 grid
     cells = [
         (EFFORT["trajectories"], "agent trajectories"),
-        (EFFORT["strategies"],   "compaction strategies tested"),
+        (EFFORT["strategies"],   "compaction strategies"),
         (EFFORT["agent_steps"],  "agent steps recorded"),
-        (EFFORT["benchmarks"],   "benchmarks · SWE-bench Lite, τ-bench, long-doc"),
-        (EFFORT["input_tokens"], "input tokens (cached + uncached)"),
+        (EFFORT["benchmarks"],   "benchmarks"),
+        (EFFORT["input_tokens"], "input tokens"),
         (EFFORT["phases"],       "experimental phases"),
+        (EFFORT["api_cost"],     "Anthropic API spend"),
+        (EFFORT["gpu_hours"],    "GPU hours (Blackwell + SEAS + Modal)"),
     ]
-    grid_x0, grid_y0 = 1.2, 2.55
-    cw, ch = 3.7, 1.85
-    gx, gy = 0.25, 0.2
+    grid_x0, grid_y0 = 1.05, 2.55
+    cw, ch = 2.78, 1.85
+    gx, gy = 0.20, 0.2
     for i, (big, label) in enumerate(cells):
-        col = i % 3
-        row = i // 3
+        col = i % 4
+        row = i // 4
         x = grid_x0 + col * (cw + gx)
         y = grid_y0 + row * (ch + gy)
         add_shape(s, x, y, cw, ch, fill=NAVY)
-        add_text(s, x, y + 0.1, cw, 0.95, big, size=46, bold=True,
+        add_text(s, x, y + 0.1, cw, 0.95, big, size=36, bold=True,
                  color=WARM, align="center", valign="middle", font=HEAD_FONT)
-        add_text(s, x + 0.15, y + 1.1, cw - 0.3, 0.65, label,
-                 size=12, color=LIGHT_NAVY, align="center", valign="top")
+        add_text(s, x + 0.1, y + 1.1, cw - 0.2, 0.65, label,
+                 size=11, color=LIGHT_NAVY, align="center", valign="top")
 
     # Compute footer
     add_text(s, 1.2, 6.7, 11, 0.4,
