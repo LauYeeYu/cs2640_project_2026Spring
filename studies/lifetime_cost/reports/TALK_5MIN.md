@@ -1,105 +1,98 @@
-# AdaptiveCache — 5-minute talk script
+# 5-minute talk — for an audience new to the area
 
-**Total: 5 minutes. 5 slides. Speaker notes are what to *say*, in the rhythm and length you'd actually deliver.**
+**One finding, told as a story. No jargon.**
 
 ---
 
-## Slide 1 — Hook + thesis (0:00 → 0:50)
+## Slide 1 — The hook (0:00 → 0:40)
 
-**Visual:** title slide. One sentence: *"Long-running LLM agents pay a cliff tax. Can we beat it with smart compaction?"* Below it: project arc.
-
-![Project arc — measurement → empirical → mechanism → portability](figures/fig6_project_arc.png)
+**Visual:** title slide. *"I gave four AI agents the same bug to fix. The one that succeeded was the one I told the least."*
 
 **Say:**
 
-> LLM agents that run for hundreds of turns spend most of their dollars on cached prefix reuse. Cached tokens cost ten percent of uncached. So when an agent's context grows, the natural fix is compaction — drop or summarize old tool outputs to keep the prompt small. But compaction has a hidden cost: any change to the prefix invalidates the downstream cache. The next API call gets re-billed at ten times the rate. We call this the cliff tax.
+> AI assistants like ChatGPT can do more than chat — they can **act**. They read files, run tests, edit code, all in a loop. We call that an *agent*. Agents are powerful, but they have a memory problem: every step they take is added to a growing record, and every step gets more expensive than the last because the AI has to re-read everything it's done.
 >
-> Our project asked the simplest, sharpest version of the question: **can a training-free heuristic compaction policy Pareto-dominate `none` — no compaction at all — on real agent benchmarks?** I'll tell you what we built, where it wins, where it loses, and the one mechanism finding that surprised us.
+> The natural fix is what humans do: **drop old stuff you don't need anymore.** That's what this project is about. And along the way, we found something surprising — a small design choice nobody talks about can decide whether the AI succeeds or fails. That's the story I want to tell you.
 
 ---
 
-## Slide 2 — What we built + the cliff tax (0:50 → 1:50)
+## Slide 2 — The setup (0:40 → 1:30)
 
-**Visual:** the cliff tax — 10× cost amplification per compaction event.
-
-![Cliff tax — 10× cost amplification per compaction event](figures/fig5_cliff_amplification.png)
+**Visual:** simple cartoon — an agent's "memory" filling up with file reads and search results.
 
 **Say:**
 
-> We built a complete lifetime-cost evaluation harness. Eight policies — naive summary, prefix-preserving, microcompact, position-aware, an LLM reorganizer, our novel action-graph supersession family. Two benchmarks: SWE-bench Lite live mode without docker, and τ-bench retail with a new multi-customer chain harness we built. Two model classes: Qwen3-30B-A3B local, and Haiku 4.5 over the API.
+> Imagine an AI debugging a piece of software. It opens a file. Reads a hundred lines. Searches for a function. Runs a test. By step thirty, the AI's *memory* is full of old file contents that don't matter anymore — it already moved on. So we'd like to clear those out.
 >
-> Most importantly we built a *real* test validator — replay the agent's edits onto a fresh checkout, apply SWE-bench's test patch, run pytest in a Python 3.9 venv per task. That found that the line-overlap oracle the field uses overcounts correctness by **30 percent**.
+> Here's the trick. When you remove something from the AI's memory, you can leave a **note** behind, like a Post-it that says *"I read this file already."* That note tells the AI "I've seen this; don't go look again." So the question is: **what should the note say?**
 >
-> The cliff tax, measured on real Haiku trajectories, is **ten to fifteen cents per compaction event**. To break even you need at least five steps after the cliff. That's the number that determines everything.
+> Should it just say "I read this file"? Or should it summarize what was in the file? Logically, more information is better, right? The AI will know what's in the file without going back. We tested that.
 
 ---
 
-## Slide 3 — Where compaction DOES win (1:50 → 2:50)
+## Slide 3 — The experiment (1:30 → 2:50)
 
-**Visual:** Pareto wins at small N — Haiku (left) and Qwen (right).
+**Visual:** `fig3_placeholder_ablation.png`
 
-![Where compaction DOES win — Pareto wins at small N](figures/fig7_compaction_wins.png)
+![Placeholder ablation — pytest-7490](figures/fig3_placeholder_ablation.png)
 
 **Say:**
 
-> Here are the wins. Left panel: on Haiku at four SWE-bench Lite tasks, our novel **action-graph supersession** policy — `consumption_evict` — resolves three out of four at one dollar three cents per task. `none` resolves only two out of four, and pays one dollar twenty. **More resolutions at lower cost.** The signal is real: it tags tool observations as consumed when the agent's *own* later tool calls make them obviously stale — `read_file` consumed by `edit_file`, search results consumed by following the lead, run_tests cascading. No prior compaction system uses agent tool-graph semantics this way.
+> We took one tricky bug — a real bug from a real Python testing library — and ran the AI on it four times, changing only one thing: **what the Post-it said.**
 >
-> Right panel: on the weaker Qwen3 agent, `none` scores zero out of four — it falls into false-submit and context-overflow loops at temperature point five. `smart_evict` scores two out of four. Compaction *prevents* catastrophic failure. **Below an agent-quality threshold, compaction is necessary, not just optimization.**
+> Version one: **plain Post-it.** "I read this file." Nothing else.
+>
+> Version two: **detailed Post-it.** "I read this file. It contained these five functions: setup, configure, runtest, makereport, evaluate."
+>
+> Both designs are reasonable. The detailed one preserves more information, costs almost nothing extra. You'd expect it to do better.
+>
+> What you're looking at is the result, replicated across two runs. The **green bars** are when the AI fixed the bug. The **orange bar** is when it failed. The **detailed Post-it lost both times** — and not by a little. The AI tried to fix the bug **eighteen times in a row** on the same wrong function. The plain Post-it succeeded in **four edits.**
 
 ---
 
-## Slide 4 — The mechanism finding (2:50 → 3:50)
+## Slide 4 — Why this happens (2:50 → 3:50)
 
-**Visual:** placeholder-design ablation on `pytest-7490` across two seeds.
-
-![Placeholder-design ablation — pytest-7490 mechanism replicates across seeds](figures/fig3_placeholder_ablation.png)
+**Visual:** keep fig3 on the slide, with one sentence overlay: *"More information in the note → AI commits to the wrong hypothesis."*
 
 **Say:**
 
-> Here's the surprising mechanism, which replicates across two seeds. We took the same `consumption_evict` signal and ablated only the placeholder — what to leave behind when we evict.
+> Why would more information make things worse? Here's the mechanism.
 >
-> Plain placeholder: `[evicted: ~N tokens, consumed by later edit]`. Forces the agent to re-fetch if it wants to act.
+> When the AI sees the detailed note — a list of function names — it picks one of those names and starts editing. The list looks like enough information to act on. But function names without bodies are misleading. The AI assumes which function is buggy and edits it. The test fails. It tries another edit. Fails again. **It never goes back to read the actual file** because the note seemed sufficient.
 >
-> Facts placeholder: same plus a one-line summary of the file's function definitions. *More* information, kept around at low token cost.
+> The plain note, by contrast, *forces* the AI to go re-read the file. And when it does, it sees something it missed the first time, which leads it to a different file entirely — the file that actually contains the bug.
 >
-> Outline placeholder: location breadcrumbs, `lineN: header`, plus an explicit "re-read to act" instruction.
->
-> On `pytest-7490`, the only validatable task where the four policies' trajectories diverged: plain and outline both resolve. Facts **fails** — and burns seven to eighteen edit-revert iterations on the wrong function. The function-name list anchored the agent on surface structure. **Less is more, because any structural hint can become an anchor.** That's a clean ablation, a real mechanism, and a publishable design lesson.
+> The lesson: **a confident-looking summary anchors the agent on surface details.** An empty hint forces a fresh look. **Less is more — because any structural hint can become an anchor.**
 
 ---
 
-## Slide 5 — The cliff wins at scale, and what's next (3:50 → 5:00)
+## Slide 5 — Why it matters (3:50 → 5:00)
 
-**Visual:** at N=10, no compaction policy Pareto-beats `none`.
-
-![SWE-bench Lite N=10 — `none` Pareto-dominates every compaction policy](figures/fig1_pareto_swebench.png)
-![Cost decomposition — input_uncached dominates because cliffs invalidate cache](figures/fig2_cost_decomposition.png)
+**Visual:** one sentence on a clean slide: *"The note's design decides whether the AI is smart or stuck."*
 
 **Say:**
 
-> But at N=10 on Haiku, the cliff tax wins. Every compaction policy ties `none` on resolve and costs **two to two-point-four times more**. The cost decomposition shows why: input-uncached dominates because every cliff re-bills the prefix. Even `consumption_evict`, which fires only when something is *provably* stale, loses on cost.
+> This sounds like a small finding about a Post-it note, but it's a real design lesson for anyone building AI agents — and a lot of people are.
 >
-> One more negative-but-constructive finding: on τ-bench retail with our multi-customer chain harness, even at chain-size ten where max prompt reaches fifty-four thousand tokens — well past the trigger — `consumption_evict` fires **zero** times. Why? Its supersession rules are coding-specific. Retail tools don't match `read_file` and `edit_file`. Action-graph supersession isn't a one-shot policy — it's a *family parameterized by per-domain rules*.
+> First: counter-intuitively, **giving an AI more context can hurt it.** It's not always about adding signal; sometimes you need to leave the AI room to update its own understanding.
 >
-> So: heuristic compaction loses to no-compaction on a strong agent — that's the headline negative result. But the placeholder-design ablation gives us a publishable positive nugget. And the negative result motivates Paper 2 directly: the cliff is intrinsic to byte-level eviction. The way around it is to **keep the bytes** — KV-pointer recall — and that's what's next.
-
-**End on:** *"Thank you. Questions?"*
+> Second, this connects to a bigger question my project cares about: **can we make long-running AI agents cheaper without making them dumber?** The Post-it experiment is one slice of that. The full project tested eight different memory-management strategies; on strong AI agents none of them clearly beat doing nothing — because the cost of *changing* the AI's memory turns out to be larger than the savings.
+>
+> So we have a constructive negative result, plus this one sharp positive: when you do compress, what you leave behind matters more than what you remove. Thank you.
 
 ---
 
-## Pacing checklist
+## Pacing target
 
-| Slide | Target | Words |
+| Slide | Time | Words |
 |---|---|---:|
-| 1 — Hook | 50s | ~125 |
-| 2 — Setup + cliff | 60s | ~150 |
-| 3 — Where it wins | 60s | ~155 |
-| 4 — Placeholder mechanism | 60s | ~150 |
-| 5 — Negative result + next | 70s | ~175 |
-| **Total** | **~5:00** | **~755** |
+| 1 — Hook | 40s | ~110 |
+| 2 — Setup | 50s | ~140 |
+| 3 — Experiment | 80s | ~160 |
+| 4 — Mechanism | 60s | ~145 |
+| 5 — Why it matters | 70s | ~160 |
+| **Total** | **5:00** | **~715** |
 
-(Adjust by trimming the supersession rule list in slide 3 or the placeholder definitions in slide 4 if running long.)
+## If running short
 
-## If you have only 3 minutes
-
-Cut slides 2 and 5's preamble. Open with slide 3 (where it wins), use slide 4 as the "even when it loses, here's the mechanism" pivot, and close with the one-line cliff-tax negative result + Paper 2 motivation. The mechanism finding is what to protect.
+Cut Slide 5's first paragraph — go straight from the lesson to "this is part of a bigger project on making long-running AI cheaper" + "thank you."
