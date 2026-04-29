@@ -84,6 +84,20 @@ models:
     cache_write:    0.0
     tokenizer:    "hf:Qwen/Qwen3-8B"
 
+  Qwen/Qwen3-4B-Instruct-2507:             # A6000 local summarizer (bf16, ~8 GB weights)
+    input_uncached: 0.025
+    input_cached:   0.0025
+    output:         0.075
+    cache_write:    0.0
+    tokenizer:    "hf:Qwen/Qwen3-4B-Instruct-2507"
+
+  vllm:Qwen/Qwen3-4B-Instruct-2507:
+    input_uncached: 0.025
+    input_cached:   0.0025
+    output:         0.075
+    cache_write:    0.0
+    tokenizer:    "hf:Qwen/Qwen3-4B-Instruct-2507"
+
   meta/llama-3.3-70b-together:             # Together.ai serverless
     input_uncached: 0.88
     input_cached:   0.088                   # estimated; Together publishes prefix-cache discount

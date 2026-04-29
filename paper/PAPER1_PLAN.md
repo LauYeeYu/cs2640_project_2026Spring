@@ -1,6 +1,42 @@
 # Paper 1 — Plan
 
-## Working title
+## STATUS (2026-04-28): Gate B failed → reframe to honest negative result
+
+**Phases B/C/D/E shipped 5+ heuristic compaction policies × 2 benchmarks × 2 model classes (Qwen3-30B-A3B, Haiku 4.5).** Aggregate finding:
+
+- **No heuristic compaction policy Pareto-dominates `none`** on a strong agent (Haiku) at any benchmark we ran (τ-bench airline, τ-bench retail, SWE-bench Lite N=4, N=10).
+- **On τ-bench (airline + retail single-customer): nothing to compact** — max prompt averages 9-15K tokens, well under any sane trigger. 0 compactions across all policies.
+- **On SWE-bench Lite Haiku N=10:** plain `consumption_evict` ties `none` at 5/10 real-resolved; cost ~2.2× higher. Outline mode ties resolve, costs ~2.4× more. Facts mode regresses to 4/10. *No policy on the Pareto frontier matches `none`.*
+- **Below an agent-quality threshold (Qwen3-30B-A3B, single seed):** `smart_evict` beats `none` because it prevents catastrophic failure modes (false-submit, context overflow) — but the win is single-seed RNG-fragile and doesn't replicate at multi-seed.
+
+**This was anticipated.** Gate B (this document, original) says: *"at least ONE policy beats `none` by ≥10% on lifetime cost at equal resolve rate on at least ONE benchmark × model cell. If no — hard reframe needed (maybe to the negative-result framing)."* Reframing now.
+
+### Working title (revised)
+
+**The Cliff Tax: Why Training-Free Heuristic Compaction Loses to No-Compaction on Strong Agents**
+
+### Pitch (revised)
+
+Lifetime cost of long-running LLM agents is dominated by prefix-cache reuse. Every compaction event invalidates downstream cache, billing the next K tokens at 10× cost. We show empirically that across 8 training-free heuristic compaction policies (FIFO, naive_summary, microcompact, prefix_preserving, position_aware, boundary_aware, smart_evict, llm_reorganizer, and our novel **action-graph supersession** family) and 2 benchmark classes (coding-agent, customer-service tool-use), no policy Pareto-dominates `none` on a strong agent. The cliff tax exceeds the bytes-saved benefit on every realistic configuration. We characterize *why* — including a mechanism finding that **placeholder design dominates resolve outcomes** (less informative is more, because structural hints anchor the agent's hypotheses) — and use this as the empirical case for Paper 2's KV-pointer recall (offload bytes, keep KV, no cliff).
+
+### Positive contributions inside the negative result
+
+1. **Lifetime-cost framing + measurement.** The `pipeline/pricing.py` infrastructure attributes cost to policy events properly (cliff cost, summarizer call cost, cache write cost) across 5 provider price columns.
+2. **Action-graph supersession as a novel signal.** The `consumption_evict` family uses agent tool-call semantics (read_file→edit_file consumes; run_tests cascade; etc.) to identify *confirmed-stale* obs without LLM scoring or attention. No prior compaction system uses tool-graph supersession; we ship it open-source. **It works mechanistically** (correctly tags consumed obs, max prompt drops 30%) — but the cliff overhead still loses on cost.
+3. **Placeholder-design ablation (Phase E v1).** Three placeholder variants on the same eviction signal: `[evicted: ~N tokens]` (plain), `[… — fact: <function defs>]` (facts), `[… outline: L1 imports, L17 class …]` (outline). On `pytest-7490` we see plain wins, facts loses (anchoring loop), outline wins. The mechanism story: a structural-hint placeholder *anchors* the agent on surface structure, inducing edit-revert loops on misidentified functions. **Less is more.** This is a publishable nugget.
+4. **Real-test validation infrastructure.** `scripts/validate_with_tests.py` replays agent edit_file calls onto fresh checkouts at base_commit, applies `test_patch`, runs FAIL_TO_PASS in per-instance Python 3.9 venvs. Replaces line-overlap oracle (which overcounted by ~30% on our N=10 set). Reusable for any agent harness.
+5. **Empirical motivation for Paper 2.** Our negative result is the cleanest empirical case for KV-pointer recall: byte-level eviction is fundamentally bounded by the cache-cliff cost-amplification factor (~10×). Keeping the bytes (offload-and-recall) is the only way around it.
+
+### Open paper-quality items before submission
+
+- [ ] **Multi-seed at N=10 SWE-bench Lite** (3 seeds × 4 policies × 10 tasks = 120 trajectories, ~$15 Haiku, ~3 hr wall). Establishes whether 5/10 vs 4/10 differences are above sampling noise. Required for any robust claim.
+- [ ] **Paired t-test** on per-task cost (`none` vs each policy) across seeds. Drives the "no Pareto domination" claim from descriptive to inferential.
+- [ ] **Multi-customer τ-bench chain harness** (optional but compelling): extend `taubench.py` with `chain_size: int` so N customer tasks are stitched into one ~150-turn trajectory. Tests whether compaction wins when context *forces* it. ~50 LOC, ~$8 to run N=10 chains × 4 policies.
+- [ ] **One figure per contribution claim.** Need: (a) Pareto frontier across all phases, (b) cliff-distribution histogram per policy, (c) cost-decomposition stacked bars, (d) placeholder-design ablation bar (the pytest-7490 mechanism finding), (e) provider-invariance table.
+
+---
+
+## Working title (legacy, retained for diff)
 
 **AdaptiveCache: Importance-Scored Compaction for Agentic Context Management**
 

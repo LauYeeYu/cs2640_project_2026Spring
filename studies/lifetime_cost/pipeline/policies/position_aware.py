@@ -76,8 +76,10 @@ class PositionAware(CompactionPolicy):
         middle = messages[head_end:tail_start]
         tail = messages[tail_start:]
 
-        # Drop big tool obs from the middle. Keep small tool obs and all
-        # assistant/user messages (low compute, high signal).
+        # Hole big tool obs in the middle (replace content with a small
+        # placeholder, keep the message envelope so tool_call_id references
+        # in the prior assistant turns still resolve under the chat template).
+        # Keep small tool obs and all assistant/user messages.
         kept_middle = []
         dropped = 0
         dropped_tokens = 0
@@ -86,20 +88,16 @@ class PositionAware(CompactionPolicy):
             if m.get("role") == "tool" and tok >= self.big_threshold:
                 dropped += 1
                 dropped_tokens += tok
+                holed = dict(m)
+                holed["content"] = f"[evicted: ~{tok} tokens, position_aware policy]"
+                kept_middle.append(holed)
                 continue
             kept_middle.append(m)
 
         if dropped == 0:
             return messages, None
 
-        # Insert a marker so later turns know context was dropped (this is
-        # important for the model not to be confused by missing tool ids).
-        marker = {
-            "role": "user",
-            "content": f"[Position-aware compaction: dropped {dropped} large tool observations from the middle of this trace, totaling ~{dropped_tokens} tokens. Re-issue the tool call if you need that information again.]",
-        }
-
-        new_messages = head + kept_middle + [marker] + tail
+        new_messages = head + kept_middle + tail
         n_after = self._token_count(new_messages, ctx.tokenizer)
         return new_messages, CompactionEvent(
             step=ctx.step,

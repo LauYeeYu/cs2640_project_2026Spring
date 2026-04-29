@@ -7,6 +7,7 @@ compaction actually triggers (not single-shot QA).
 
 from .base import Task, ToolEnv, Tool
 from .swebench_replay import SWEBenchReplay
+from .swebench_live import SWEBenchLive
 from .taubench import TauBench
 from .gaia import GAIA
 from .longdoc import LongDocAgent
@@ -14,6 +15,7 @@ from .longdoc import LongDocAgent
 
 REGISTRY = {
     "swebench_replay": SWEBenchReplay,
+    "swebench_live": SWEBenchLive,
     "taubench": TauBench,
     "gaia": GAIA,
     "longdoc": LongDocAgent,
@@ -27,4 +29,4 @@ def build_benchmark(name: str, **kwargs):
 
 
 __all__ = ["Task", "ToolEnv", "Tool", "build_benchmark", "REGISTRY",
-           "SWEBenchReplay", "TauBench", "GAIA", "LongDocAgent"]
+           "SWEBenchReplay", "SWEBenchLive", "TauBench", "GAIA", "LongDocAgent"]

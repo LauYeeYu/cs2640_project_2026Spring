@@ -16,12 +16,15 @@ REGISTRY = {
 def build_model(model_name: str, *, adapter: str = "auto", **kwargs) -> ChatModel:
     """Build a ChatModel by name. adapter='auto' picks based on model_name prefix.
 
-    'hf_local' loads a model in-process via HuggingFace transformers — used
-    for cluster-local runs without setting up an HTTP server.
+    'hf_local' loads a model in-process via HuggingFace transformers.
+    'vllm_local' loads via vLLM (paged attention + auto prefix cache).
+    Use 'vllm:<model>' or pass adapter='vllm_local' to select vLLM.
     """
     if adapter == "auto":
         if model_name.startswith("anthropic/"):
             adapter = "anthropic"
+        elif model_name.startswith("vllm:"):
+            adapter = "vllm_local"
         elif model_name.startswith("hf:") or model_name.startswith(("Qwen/", "meta-llama/", "microsoft/", "mistralai/")):
             adapter = "hf_local"
         else:
@@ -30,6 +33,10 @@ def build_model(model_name: str, *, adapter: str = "auto", **kwargs) -> ChatMode
         from .hf_local import HFLocalModel
         actual = model_name.removeprefix("hf:")
         return HFLocalModel(model_name=actual, **kwargs)
+    if adapter == "vllm_local":
+        from .vllm_local import VLLMLocalModel
+        actual = model_name.removeprefix("vllm:").removeprefix("hf:")
+        return VLLMLocalModel(model_name=actual, **kwargs)
     cls = REGISTRY[adapter]
     return cls(model_name=model_name, **kwargs)
 

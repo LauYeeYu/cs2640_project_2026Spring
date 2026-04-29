@@ -31,17 +31,24 @@ class PrefixPreserving(CompactionPolicy):
         keep_recent_turns: int = 4,
         trigger_ratio: float = 0.85,
         target_ratio: float = 0.50,
+        cooldown_steps: int = 0,
     ):
         super().__init__(
             keep_first_turns=keep_first_turns,
             keep_recent_turns=keep_recent_turns,
             trigger_ratio=trigger_ratio,
             target_ratio=target_ratio,
+            cooldown_steps=cooldown_steps,
         )
         self.keep_first_turns = keep_first_turns
         self.keep_recent_turns = keep_recent_turns
         self.trigger_ratio = trigger_ratio
         self.target_ratio = target_ratio
+        # Cooldown: after a compaction at step S, next fire allowed at S+cooldown_steps.
+        # Prevents the rapid-fire pattern where summary lands just under the trigger
+        # and the next 1-2 turns push it back over.
+        self.cooldown_steps = cooldown_steps
+        self._last_compaction_step: int = -10**9
         # Frozen prefix: once we commit to keep_first_turns turns at compaction
         # time, we never rewrite them. The runner enforces this via _frozen_idx.
         self._frozen_idx: int = 0
@@ -67,6 +74,8 @@ class PrefixPreserving(CompactionPolicy):
         if n_tok < self.trigger_ratio * ctx.budget:
             return messages, None
         if ctx.summarizer is None:
+            return messages, None
+        if ctx.step - self._last_compaction_step < self.cooldown_steps:
             return messages, None
 
         boundaries = self._turn_boundaries(messages)
@@ -106,6 +115,7 @@ class PrefixPreserving(CompactionPolicy):
         }
         new_messages = head + [summary_msg] + tail
         n_after = self._token_count(new_messages, ctx.tokenizer)
+        self._last_compaction_step = ctx.step
 
         return new_messages, CompactionEvent(
             step=ctx.step,

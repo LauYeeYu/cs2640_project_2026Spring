@@ -46,6 +46,9 @@ class ToolEnv:
     def schemas(self) -> List[Dict[str, Any]]:
         return [t.to_openai() for t in self._tools.values()]
 
+    def __contains__(self, name: str) -> bool:
+        return name in self._tools
+
     def call(self, name: str, args: Dict[str, Any]) -> str:
         if name not in self._tools:
             return f"[tool error] unknown tool: {name}"

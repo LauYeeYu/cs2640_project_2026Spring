@@ -25,6 +25,10 @@ class CompactionContext:
     hard_budget: int                             # hard trigger; must compact
     tokenizer: Tokenizer
     summarizer: Optional[Callable[[List[dict]], Tuple[str, int, int, int]]] = None
+    summarizer_model: Optional[object] = None    # ChatModel; for policies that want
+                                                 # to issue arbitrary prompts (e.g.
+                                                 # llm_reorganizer's scoring call)
+                                                 # rather than the standard summary.
     """A callable returning (summary_text, in_cached_tokens, in_uncached_tokens,
     out_tokens) given a list of messages to summarize.
 

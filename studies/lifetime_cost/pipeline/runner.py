@@ -126,22 +126,49 @@ def run_task(
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.get("id", ""),
-                    "content": obs[:20_000],   # safety cap on tool output
+                    "content": obs[:80_000],   # safety cap on tool output (was 20K — too tight when files don't fit and agent loops re-reading)
                 })
                 # If submit was called, record the answer
                 if name in ("submit", "respond"):
                     final_answer = args.get("answer") or args.get("content") or final_answer
+                # tau-bench signals end-of-conversation via "###STOP###"
+                if "###STOP###" in (obs or ""):
+                    done = True
+        elif resp.content and "respond" in task.tool_env:
+            # Qwen3-style models emit plain text instead of wrapping a user-facing
+            # reply in the `respond` tool. When `respond` is available (τ-bench),
+            # treat the plain text as the message to the user, step the simulator,
+            # and append its reply as a normal user turn so the dialogue continues
+            # in the form Qwen3's chat template expects.
+            obs = task.tool_env.call("respond", {"content": resp.content})
+            final_answer = resp.content
+            if "###STOP###" in (obs or ""):
+                done = True
+            else:
+                messages.append({"role": "user", "content": obs[:80_000]})
+        elif resp.content and "submit" in task.tool_env:
+            # Coding-agent style (SWE-bench live): no `respond`, but `submit`
+            # exists. Plain-text turns happen when the agent reasons aloud
+            # ("now I'll edit X"). Don't terminate — append a kick reminder
+            # and let the next turn act. Bounded by max_steps so this can't loop
+            # forever.
+            messages.append({
+                "role": "user",
+                "content": "Reminder: please call a tool to make progress (read_file / edit_file / search / run_tests), or call submit() if the task is complete.",
+            })
         else:
-            # No tool call → treat as final answer
+            # No tool call and no respond/submit channel → treat as final answer.
             done = True
             final_answer = resp.content
 
         # Compaction
+        _summarizer_chatmodel = summarizer_model or model
         ctx = CompactionContext(
             step=step_idx,
             budget=budget_tokens,
             hard_budget=hard_budget_tokens,
             tokenizer=tokenizer,
+            summarizer_model=_summarizer_chatmodel,
             summarizer=summarizer,
         )
         messages, comp_event = policy.maybe_compact(messages, ctx)
