@@ -36,11 +36,12 @@ from studies.lifetime_cost.paper2.policy.memento_policy import MementoPolicy
 
 
 MODEL = os.environ.get("PAPER2_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
-INSTANCE_ID = os.environ.get("PAPER2_INSTANCE", "psf__requests-3362")
+DEFAULT_INSTANCES = "psf__requests-3362,pallets__flask-5063,pylint-dev__pylint-7080,pytest-dev__pytest-7490"
+INSTANCE_IDS = [s.strip() for s in os.environ.get("PAPER2_INSTANCES", DEFAULT_INSTANCES).split(",") if s.strip()]
 MIN_OBS_CHARS = int(os.environ.get("PAPER2_MIN_OBS_CHARS", "300"))
 MAX_STEPS = int(os.environ.get("PAPER2_MAX_STEPS", "20"))
-GPU_MEM_UTIL = float(os.environ.get("PAPER2_GPU_UTIL", "0.85"))
-MAX_MODEL_LEN = int(os.environ.get("PAPER2_MAX_LEN", "32000"))
+GPU_MEM_UTIL = float(os.environ.get("PAPER2_GPU_UTIL", "0.92"))
+MAX_MODEL_LEN = int(os.environ.get("PAPER2_MAX_LEN", "65000"))
 OUT_DIR = Path(os.environ.get("PAPER2_OUT_DIR", "/home/vlad/adaptivecache-paper2/studies/lifetime_cost/paper2/out_v0_swebench"))
 
 
@@ -58,34 +59,16 @@ def _summarize_step(step, idx, max_msg_chars=400):
             print(f"    tool_call: {fn.get('name')!r}({fn.get('arguments')!r})")
 
 
-def main():
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    bench = SWEBenchLive(
-        instance_ids=[INSTANCE_ID],
-        cache_dir="/scratch/swebench_repos",
-        max_steps_per_task=MAX_STEPS,
-    )
-    tasks = list(bench.tasks())
-    if not tasks:
-        print(f"ERROR: no tasks for instance_id={INSTANCE_ID}")
-        return
-    task = tasks[0]
-    print(f"Task: {task.id}, max_steps={task.max_steps}")
-
-    masking = os.environ.get("PAPER2_MASKING", "1") == "1"
-    label = "memento" if masking else "baseline"
-
-    print(f"\n--- starting {label} run on {task.id} ---")
+def _run_one_task(task, *, masking: bool, label: str):
+    print(f"\n--- {label} on {task.id} ---")
     model = MementoVLLMModel(
         model_name=MODEL,
         gpu_memory_utilization=GPU_MEM_UTIL,
         max_model_len=MAX_MODEL_LEN,
         masking_enabled=masking,
-        debug_masking=masking,  # log BlockMasking events for masking variant
+        debug_masking=False,
     )
     policy = MementoPolicy(min_obs_chars=MIN_OBS_CHARS) if masking else NoCompaction()
-
     t0 = time.perf_counter()
     traj = run_task(
         task, model, policy,
@@ -94,27 +77,76 @@ def main():
         hard_budget_tokens=30_000,
         max_completion_tokens=1024,
     )
-    wall_total = (time.perf_counter() - t0) * 1000
+    wall_total_ms = int((time.perf_counter() - t0) * 1000)
 
-    # Persist
     out_path = OUT_DIR / f"{label}_{task.id.replace('/', '_')}.json"
     with open(out_path, "w") as f:
         json.dump(traj.to_dict(), f, indent=2, default=str)
-    print(f"\nSaved trajectory: {out_path}")
 
-    # Print summary
-    print(f"\n=== {label} summary ===")
-    print(f"  steps: {len(traj.steps)}")
-    print(f"  resolved: {traj.resolved}")
-    print(f"  total wall ms: {wall_total:.0f}")
-    print(f"  prompt tokens: {traj.total_prompt_tokens}, cached: {traj.total_cached_tokens}, completion: {traj.total_completion_tokens}")
-    print(f"  num compactions: {traj.num_compactions}")
-    print(f"  final answer: {(traj.final_answer or '')[:200]!r}")
+    chat_wall = sum(s.wallclock_ms for s in traj.steps)
+    haiku_wall = sum((s.compaction_after.wallclock_ms if s.compaction_after else 0) for s in traj.steps)
+    print(f"  steps={len(traj.steps)} resolved={traj.resolved} chat_wall={chat_wall}ms haiku_wall={haiku_wall}ms total={wall_total_ms}ms compactions={traj.num_compactions} final_prompt={traj.steps[-1].usage.prompt_tokens if traj.steps else 0}")
+    return {
+        "task_id": task.id,
+        "label": label,
+        "steps": len(traj.steps),
+        "resolved": traj.resolved,
+        "chat_wall_ms": chat_wall,
+        "haiku_wall_ms": haiku_wall,
+        "total_wall_ms": wall_total_ms,
+        "num_compactions": traj.num_compactions,
+        "final_prompt_tokens": traj.steps[-1].usage.prompt_tokens if traj.steps else 0,
+        "final_answer_truncated": (traj.final_answer or "")[:120],
+    }
 
-    # Per-step view
-    print(f"\n=== per-step trace ({len(traj.steps)} steps) ===")
-    for i, step in enumerate(traj.steps):
-        _summarize_step(step, i)
+
+def main():
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    bench = SWEBenchLive(
+        instance_ids=INSTANCE_IDS,
+        cache_dir="/scratch/swebench_repos",
+        max_steps_per_task=MAX_STEPS,
+    )
+    tasks = list(bench.tasks())
+    print(f"Loaded {len(tasks)} task(s): {[t.id for t in tasks]}")
+
+    # Run order: all baseline first (engine cache reuses across tasks),
+    # then all memento (cache reuses again). Avoids re-init thrash.
+    masking_default = os.environ.get("PAPER2_MASKING", "both")
+    do_baseline = masking_default in ("0", "both")
+    do_memento = masking_default in ("1", "both")
+
+    rows = []
+    if do_baseline:
+        for task in tasks:
+            rows.append(_run_one_task(task, masking=False, label="baseline"))
+    if do_memento:
+        for task in tasks:
+            rows.append(_run_one_task(task, masking=True, label="memento"))
+
+    # Save aggregate + print pivot
+    summary_path = OUT_DIR / "summary.json"
+    with open(summary_path, "w") as f:
+        json.dump(rows, f, indent=2, default=str)
+    print(f"\nSaved aggregate: {summary_path}")
+
+    # Per-variant totals
+    print("\n=== per-task ===")
+    print(f"{'task_id':<28} {'variant':<10} {'steps':>5} {'resolved':>9} {'chat_ms':>8} {'haiku_ms':>9} {'final_tok':>10} {'compac':>7}")
+    for r in rows:
+        print(f"{r['task_id']:<28} {r['label']:<10} {r['steps']:>5} {str(r['resolved']):>9} {r['chat_wall_ms']:>8} {r['haiku_wall_ms']:>9} {r['final_prompt_tokens']:>10} {r['num_compactions']:>7}")
+
+    print("\n=== aggregate ===")
+    for label in ("baseline", "memento"):
+        sel = [r for r in rows if r["label"] == label]
+        if not sel:
+            continue
+        n = len(sel)
+        resolved = sum(1 for r in sel if r["resolved"])
+        chat_total = sum(r["chat_wall_ms"] for r in sel)
+        haiku_total = sum(r["haiku_wall_ms"] for r in sel)
+        print(f"  {label}: tasks={n}, resolved={resolved}/{n}, total_chat_wall={chat_total/1000:.1f}s, total_haiku_wall={haiku_total/1000:.1f}s")
 
 
 if __name__ == "__main__":
