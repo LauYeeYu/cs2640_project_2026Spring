@@ -599,6 +599,352 @@ def fig_compaction_wins():
     print(f"  wrote {OUT_DIR / 'fig7_compaction_wins.png'}")
 
 
+def fig_vision():
+    """The AdaptiveCache vision figure.
+
+    Two horizontal strips:
+      Top  — current layout (items in arrival order, all uncached after the system prompt)
+      Bottom — after AdaptiveCache layout pass (stable/important promoted to
+               the cached prefix zone; exhausted suffix items become holes)
+
+    Annotations: cached prefix zone (frozen, reused step-to-step) vs.
+    volatile suffix zone (where eviction happens for free).
+    """
+    fig, ax = plt.subplots(figsize=(16, 9))
+    ax.set_xlim(0, 100)
+    ax.set_ylim(0, 110)
+    ax.axis("off")
+
+    # Color palette by item type
+    C_SYS    = "#3B5BA9"  # system prompt — always cached
+    C_STABLE = "#0072B2"  # stable / important (function defs, problem statement)
+    C_KEEP   = "#009E73"  # recent / source-of-truth tool obs
+    C_USED   = "#E69F00"  # consumed / exhaust (will be evicted)
+    C_HOLE   = "#D9D9D9"  # hole left by eviction
+    C_NEW    = "#CC79A7"  # newly arrived
+
+    # ---------- TOP STRIP: BEFORE ----------
+    y0 = 78
+    h  = 12
+
+    items_before = [
+        ("system\nprompt",         8,  C_SYS,    "cached"),
+        ("file A\nread",           7,  C_USED,   "exhaust"),
+        ("search\nresults",        6,  C_USED,   "exhaust"),
+        ("important\nfunction",    7,  C_STABLE, "stable"),
+        ("file B\nedited",         6,  C_USED,   "exhaust"),
+        ("test run\noutput",       6,  C_USED,   "exhaust"),
+        ("important\nstacktrace",  6,  C_STABLE, "stable"),
+        ("redundant\nsearch",      5,  C_USED,   "exhaust"),
+        ("recent\nfile read",      6,  C_KEEP,   "recent"),
+        ("recent\ndialogue",       7,  C_KEEP,   "recent"),
+    ]
+
+    x = 5
+    centers_before = {}
+    for label, w, color, _kind in items_before:
+        rect = plt.Rectangle((x, y0), w, h, facecolor=color, edgecolor="black", linewidth=0.7)
+        ax.add_patch(rect)
+        ax.text(x + w / 2, y0 + h / 2, label, ha="center", va="center",
+                fontsize=8.5, fontweight="bold",
+                color=("white" if color in (C_SYS, C_STABLE, C_USED) else "black"))
+        centers_before[label] = (x + w / 2, y0)
+        x += w + 0.6
+
+    ax.text(50, y0 + h + 3,
+            "BEFORE — items in arrival order; only the system prompt is cached across steps",
+            ha="center", fontsize=12, fontweight="bold")
+
+    # Cache zone bracket — only the system prompt
+    sys_w = items_before[0][1]
+    ax.annotate("", xy=(5, y0 - 1.5), xytext=(5 + sys_w + 0.6, y0 - 1.5),
+                arrowprops=dict(arrowstyle="-", color="#3B5BA9", lw=2.5))
+    ax.text(5 + (sys_w + 0.6) / 2, y0 - 5, "cached", ha="center", fontsize=10,
+            fontweight="bold", color="#3B5BA9")
+
+    ax.annotate("", xy=(5 + sys_w + 0.6, y0 - 1.5), xytext=(x, y0 - 1.5),
+                arrowprops=dict(arrowstyle="-", color="#888", lw=2.5))
+    ax.text((5 + sys_w + 0.6 + x) / 2, y0 - 5,
+            "uncached every step (re-billed at 10× rate)",
+            ha="center", fontsize=10, fontweight="bold", color="#888")
+
+    # ---------- BOTTOM STRIP: AFTER ----------
+    y1 = 35
+
+    items_after = [
+        ("system\nprompt",         8,  C_SYS,    "cached"),
+        ("important\nfunction",    7,  C_STABLE, "promoted"),  # was index 3
+        ("important\nstacktrace",  6,  C_STABLE, "promoted"),  # was index 6
+        ("recent\nfile read",      6,  C_KEEP,   "recent"),
+        ("recent\ndialogue",       7,  C_KEEP,   "recent"),
+        ("hole",                   4,  C_HOLE,   "hole"),
+        ("hole",                   4,  C_HOLE,   "hole"),
+        ("hole",                   3,  C_HOLE,   "hole"),
+        ("new\nfile read",         6,  C_NEW,    "new"),
+    ]
+
+    x = 5
+    centers_after = {}
+    for label, w, color, kind in items_after:
+        rect = plt.Rectangle((x, y1), w, h, facecolor=color,
+                             edgecolor="black", linewidth=0.7,
+                             alpha=(0.4 if kind == "hole" else 1.0),
+                             linestyle=("dashed" if kind == "hole" else "solid"))
+        ax.add_patch(rect)
+        if kind == "hole":
+            ax.text(x + w / 2, y1 + h / 2, "(evicted)",
+                    ha="center", va="center", fontsize=8, style="italic", color="#666")
+        else:
+            ax.text(x + w / 2, y1 + h / 2, label, ha="center", va="center",
+                    fontsize=8.5, fontweight="bold",
+                    color=("white" if color in (C_SYS, C_STABLE, C_USED) else "black"))
+        centers_after[label + str(x)] = (x + w / 2, y1 + h)
+        x += w + 0.6
+
+    ax.text(50, y1 + h + 3,
+            "AFTER — AdaptiveCache layout pass: stable items pinned to the cached prefix; "
+            "exhausted items become holes",
+            ha="center", fontsize=12, fontweight="bold")
+
+    # Cache zone bracket — now extends across the pinned stable items
+    pinned_x_start = 5
+    pinned_x_end = 5 + 8 + 0.6 + 7 + 0.6 + 6 + 0.6
+    ax.annotate("", xy=(pinned_x_start, y1 - 1.5), xytext=(pinned_x_end, y1 - 1.5),
+                arrowprops=dict(arrowstyle="-", color="#3B5BA9", lw=2.5))
+    ax.text((pinned_x_start + pinned_x_end) / 2, y1 - 5,
+            "PINNED PREFIX — cached, reused next step",
+            ha="center", fontsize=10, fontweight="bold", color="#3B5BA9")
+
+    volatile_x_start = pinned_x_end
+    ax.annotate("", xy=(volatile_x_start, y1 - 1.5), xytext=(x, y1 - 1.5),
+                arrowprops=dict(arrowstyle="-", color="#888", lw=2.5))
+    ax.text((volatile_x_start + x) / 2, y1 - 5,
+            "VOLATILE SUFFIX — eviction happens here for free",
+            ha="center", fontsize=10, fontweight="bold", color="#888")
+
+    # Arrows: promoting important items from before-positions to after-positions
+    promotions = [
+        ("important\nfunction", "important\nfunction"),
+        ("important\nstacktrace", "important\nstacktrace"),
+    ]
+    for src_label, dst_label in promotions:
+        src = centers_before[src_label]
+        dst_key = next(k for k in centers_after if k.startswith(dst_label))
+        dst = centers_after[dst_key]
+        ax.annotate("", xy=(dst[0], dst[1] + 1), xytext=(src[0], src[1] - 0.5),
+                    arrowprops=dict(arrowstyle="->", color="#0072B2", lw=2,
+                                    connectionstyle="arc3,rad=-0.15"))
+
+    # Eviction arrows: exhausted items → holes
+    evicted_sources = ["file A\nread", "search\nresults", "redundant\nsearch", "test run\noutput", "file B\nedited"]
+    hole_xs = [78, 84.5, 89.5]
+    for i, src_label in enumerate(evicted_sources[:3]):
+        src = centers_before[src_label]
+        ax.annotate("", xy=(hole_xs[i], y1 + h + 1), xytext=(src[0], src[1] - 0.5),
+                    arrowprops=dict(arrowstyle="->", color="#E69F00", lw=1.4,
+                                    alpha=0.7, connectionstyle="arc3,rad=0.10"))
+
+    # Legend
+    legend_handles = [
+        mpatches.Patch(facecolor=C_SYS, edgecolor="black", label="System prompt (always cached)"),
+        mpatches.Patch(facecolor=C_STABLE, edgecolor="black", label="Stable / high-importance (PROMOTED to prefix)"),
+        mpatches.Patch(facecolor=C_KEEP, edgecolor="black", label="Recent / source-of-truth (kept in suffix)"),
+        mpatches.Patch(facecolor=C_USED, edgecolor="black", label="Consumed / exhaust (EVICTED)"),
+        mpatches.Patch(facecolor=C_HOLE, edgecolor="black", label="Hole (no recompute, no new tokens)"),
+        mpatches.Patch(facecolor=C_NEW, edgecolor="black", label="New observation (just arrived)"),
+    ]
+    ax.legend(handles=legend_handles, loc="upper center", bbox_to_anchor=(0.5, 0.02),
+              ncol=3, fontsize=10, frameon=False)
+
+    # Title
+    ax.text(50, 107,
+            "AdaptiveCache vision — context as a live, ordered memory",
+            ha="center", fontsize=15, fontweight="bold")
+    ax.text(50, 102,
+            "Reorganize the prompt on compaction: pin stable items at the front so they stay cached;\n"
+            "leave holes in the suffix where exhausted observations used to be (free, no recompute).",
+            ha="center", fontsize=11, color="#444")
+
+    plt.savefig(OUT_DIR / "fig8_vision.png", bbox_inches="tight")
+    plt.close()
+    print(f"  wrote {OUT_DIR / 'fig8_vision.png'}")
+
+
+# ---------------------------------------------------------------------------
+# Per-method figures: one panel per compaction policy with before/after strip
+# ---------------------------------------------------------------------------
+
+def _draw_strip(ax, y, h, items, alphas=None, dashes=None, label_color_overrides=None):
+    """Draw a horizontal strip of context items at row y (item width per item)."""
+    x = 5
+    centers = []
+    alphas = alphas or [1.0] * len(items)
+    dashes = dashes or [False] * len(items)
+    label_color_overrides = label_color_overrides or {}
+    for (label, w, color), alpha, dashed in zip(items, alphas, dashes):
+        rect = plt.Rectangle((x, y), w, h, facecolor=color,
+                             edgecolor="black", linewidth=0.6,
+                             alpha=alpha, linestyle=("dashed" if dashed else "solid"))
+        ax.add_patch(rect)
+        text_color = label_color_overrides.get(label,
+                        "white" if color in ("#3B5BA9", "#0072B2", "#E69F00") else "black")
+        if alpha < 0.6:
+            text_color = "#666"
+        ax.text(x + w / 2, y + h / 2, label, ha="center", va="center",
+                fontsize=8, fontweight="bold", color=text_color, style=("italic" if alpha < 0.6 else "normal"))
+        centers.append((x + w / 2, y))
+        x += w + 0.6
+    return x, centers
+
+
+def fig_methods_panels():
+    """One small figure per compaction method, with title + tagline + before/after strip.
+
+    Each output is a slide-ready ~1500x600 PNG.
+    """
+    C_SYS    = "#3B5BA9"
+    C_STABLE = "#0072B2"
+    C_KEEP   = "#009E73"
+    C_USED   = "#E69F00"
+    C_HOLE   = "#D9D9D9"
+    C_NEW    = "#CC79A7"
+    C_SUMM   = "#9D7CD8"  # purple — summarized block
+
+    # The "before" template — wider boxes so labels fit comfortably.
+    BEFORE = [
+        ("system",      9, C_SYS),
+        ("read A",      9, C_USED),
+        ("search 1",    9, C_USED),
+        ("def f()",     9, C_STABLE),
+        ("edit B",      9, C_USED),
+        ("tests",       9, C_USED),
+        ("trace",       9, C_STABLE),
+        ("search 2",    9, C_USED),
+        ("recent file", 9, C_KEEP),
+        ("dialogue",    9, C_KEEP),
+    ]
+
+    # AFTER lists are length-10 lists (same as BEFORE); each entry is either
+    # a kept BEFORE[i] item or a replacement (hole / summary block). Widths
+    # mirror BEFORE positionally so the strips line up visually.
+    def keep(idx):
+        return BEFORE[idx]
+    def hole(idx, label="(evicted)"):
+        return (label, BEFORE[idx][1], C_HOLE)
+    def summ(idx, label):
+        return (label, BEFORE[idx][1], C_SUMM)
+
+    none_after        = [keep(i) for i in range(10)]
+    naive_after          = [keep(0)] + [summ(i, "[ summary ]") for i in range(1, 9)] + [keep(9)]
+    micro_after          = [keep(0), summ(1, "[micro]"), keep(2), keep(3), keep(4),
+                            keep(5), keep(6), keep(7), keep(8), keep(9)]
+    prefix_after         = [keep(0), keep(1), keep(2)] + [summ(i, "[ summary ]") for i in range(3, 8)] + [keep(8), keep(9)]
+    # position_aware reorders — pin important content right after system
+    position_after       = [keep(0), keep(3), keep(6), hole(3), hole(4), hole(5), hole(7), keep(2), keep(8), keep(9)]
+    evict_oldest_after   = [keep(0), hole(1), hole(2), hole(3), keep(4), keep(5), keep(6), keep(7), keep(8), keep(9)]
+    smart_after          = [keep(0), keep(1), hole(2), keep(3), keep(4), hole(5), keep(6), hole(7), keep(8), keep(9)]
+    score_periodic_after = [keep(0), hole(1), keep(2), hole(3), hole(4), keep(5), hole(6), hole(7), keep(8), keep(9)]
+    llm_reorg_after      = [keep(0), keep(3), hole(2), hole(4), keep(6), hole(5), hole(7), keep(1), keep(8), keep(9)]
+    cons_plain_after     = [keep(0), hole(1, "[evicted]"), hole(2, "[evicted]"), keep(3), keep(4),
+                            hole(5, "[evicted]"), keep(6), hole(7, "[evicted]"), keep(8), keep(9)]
+    cons_facts_after     = [keep(0), hole(1, "[+ fact]"), hole(2, "[+ fact]"), keep(3), keep(4),
+                            hole(5, "[+ fact]"), keep(6), hole(7, "[+ fact]"), keep(8), keep(9)]
+    cons_outline_after   = [keep(0), hole(1, "[+ outline]"), hole(2, "[+ outline]"), keep(3), keep(4),
+                            hole(5, "[+ outline]"), keep(6), hole(7, "[+ outline]"), keep(8), keep(9)]
+
+    methods = [
+        ("01_none",
+         "Baseline: `none` (no compaction)",
+         "Context grows step by step. Cached prefix never extends past the system prompt.",
+         none_after,
+         "Reference cost. Loses on very long sessions because everything past the system prompt re-bills uncached on every new tool call. WINS at our N=10 SWE-bench scale because compaction overhead exceeds savings."),
+        ("02_naive_summary",
+         "naive_summary",
+         "When budget hits, replace EVERYTHING in the middle with one LLM-written summary.",
+         naive_after,
+         "Smallest result, biggest cliff. Every fire writes brand-new summary tokens that nothing has cached. Loses on cost. Classic baseline."),
+        ("03_microcompact",
+         "microcompact (Claude-Code style)",
+         "Find the BIGGEST tool obs and replace IT alone with a one-line summary. Don't reorder.",
+         micro_after,
+         "Cheapest cliff — only one item changes. Only kicks in when there's an outlier-large message. Doesn't help when context is many medium-size obs."),
+        ("04_prefix_preserving",
+         "prefix_preserving",
+         "Keep first K turns frozen + an LLM summary of the middle + recent K turns. Classic.",
+         prefix_after,
+         "Stable first-K cached. But every fire writes new summary tokens that re-bill everything after the summary at uncached rate. Loses on cost."),
+        ("05_position_aware",
+         "position_aware (proto-AdaptiveCache)",
+         "Pin attention-heavy items right after the system prompt. Hole-leave the rest of the middle.",
+         position_after,
+         "First step toward the AdaptiveCache vision: REORDERS the prompt to pin important content. Hole-leaving (no recompute) for evicted items. Picks 'important' from position prior — sometimes wrong."),
+        ("06_evict_oldest",
+         "evict_oldest (FIFO)",
+         "Drop the oldest tool obs first. Leave a hole. Keep arrival order.",
+         evict_oldest_after,
+         "Simplest possible policy. Often drops what the agent ALREADY USED — that's good. But also drops irreplaceable old context. Coarse signal."),
+        ("07_smart_evict",
+         "smart_evict",
+         "Score each obs by type prior + textual reference count. Drop the lowest scored.",
+         smart_after,
+         "No LLM call. Cheap heuristic scoring. Protects function-def-shaped content. Still cliff-bound on cost. WINS on weak Qwen3 (prevents catastrophic failures)."),
+        ("08_score_periodic",
+         "score_periodic",
+         "Every N steps, run an LLM scorer over all messages. Drop the bottom-K.",
+         score_periodic_after,
+         "LLM scorer adds quality signal. But the scorer call itself costs tokens, and it fires periodically rather than only when needed."),
+        ("09_llm_reorganizer",
+         "llm_reorganizer",
+         "Small LLM scores every tool obs 1–10. Reorders + drops the bottom-K.",
+         llm_reorg_after,
+         "Could in principle reorder + drop. In practice the scorer's $/MTok overhead exceeds the bytes saved on most tasks."),
+        ("10_consumption_evict_plain",
+         "consumption_evict (plain) — OUR NOVEL POLICY",
+         "Drop only what the agent's OWN later actions made stale. Leave a minimal placeholder.",
+         cons_plain_after,
+         "No LLM, no attention. Uses agent tool-call semantics: read_file consumed by edit_file; run_tests cascade; search consumed by following the lead. WINS at small N. Replicates the placeholder mechanism finding."),
+        ("11_consumption_evict_facts",
+         "consumption_evict_facts — losing variant",
+         "Same eviction signal, but leave a SUMMARY (function defs) in the placeholder.",
+         cons_facts_after,
+         "Counter-intuitive: anchors agent on surface details (function names) → wrong-region edit-revert loops. LOSES pytest-7490 with 7–18× edits. The mechanism finding."),
+        ("12_consumption_evict_outline",
+         "consumption_evict_outline — middle-ground",
+         "Same eviction signal, leave a structural OUTLINE + 're-read to act' instruction.",
+         cons_outline_after,
+         "Location breadcrumbs (line numbers) + explicit re-read prompt. Ties plain on resolve. Cleanest design point in the family."),
+    ]
+
+    for fname, title, tagline, after, footer in methods:
+        fig, ax = plt.subplots(figsize=(14, 5.5))
+        ax.set_xlim(0, 100)
+        ax.set_ylim(0, 100)
+        ax.axis("off")
+
+        # Title
+        ax.text(50, 92, title, ha="center", fontsize=15, fontweight="bold")
+        ax.text(50, 86, tagline, ha="center", fontsize=11, color="#333", style="italic")
+
+        # BEFORE strip
+        ax.text(5, 75, "before:", ha="left", fontsize=10, color="#666", fontweight="bold")
+        _draw_strip(ax, 60, 12, BEFORE)
+
+        # AFTER strip — alphas/dashes derived from item color (holes & summaries)
+        alphas = [0.5 if it[2] == C_HOLE else 1.0 for it in after]
+        dashes = [it[2] == C_HOLE for it in after]
+        ax.text(5, 47, "after:", ha="left", fontsize=10, color="#666", fontweight="bold")
+        _draw_strip(ax, 32, 12, after, alphas=alphas, dashes=dashes)
+
+        # Footer text
+        ax.text(50, 12, footer, ha="center", fontsize=10.5, color="#222",
+                wrap=True,
+                bbox=dict(boxstyle="round,pad=0.6", fc="#f5f5f5", ec="#ccc", lw=0.6))
+
+        plt.savefig(OUT_DIR / f"method_{fname}.png", bbox_inches="tight")
+        plt.close()
+        print(f"  wrote {OUT_DIR / f'method_{fname}.png'}")
+
+
 def main():
     print(f"Generating figures into {OUT_DIR}/")
     fig_pareto_swebench()
@@ -608,6 +954,8 @@ def main():
     fig_cliff_amplification()
     fig_project_arc()
     fig_compaction_wins()
+    fig_vision()
+    fig_methods_panels()
     print("Done.")
 
 
