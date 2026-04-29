@@ -98,6 +98,8 @@ class MementoVLLMModel(ChatModel):
         enable_prefix_caching: bool = True,
         masking_enabled: bool = True,
         keep_last_n_blocks: int = 0,
+        compact_on_summary_end: bool = True,
+        restart_mode: bool = True,
         debug_masking: bool = False,
         **kwargs,
     ):
@@ -116,6 +118,7 @@ class MementoVLLMModel(ChatModel):
         cache_key = (
             model_name, dtype, gpu_memory_utilization, max_model_len,
             enable_prefix_caching, masking_enabled, keep_last_n_blocks,
+            compact_on_summary_end, restart_mode,
         )
         if cache_key not in MementoVLLMModel._engine_cache:
             os.environ.setdefault("VLLM_ATTENTION_BACKEND", "FLASHINFER")
@@ -141,8 +144,8 @@ class MementoVLLMModel(ChatModel):
                     summary_end_token=str(SUMMARY_END_ID),
                     require_assistant_section=False,
                     mask_delimiters=False,  # Qwen3 style
-                    compact_on_summary_end=True,
-                    restart_mode=True,
+                    compact_on_summary_end=compact_on_summary_end,
+                    restart_mode=restart_mode,
                     debug=debug_masking,
                 )
             MementoVLLMModel._engine_cache[cache_key] = LLM(**engine_kwargs)

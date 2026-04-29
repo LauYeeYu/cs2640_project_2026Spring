@@ -39,6 +39,7 @@ GPU_MEM_UTIL = float(os.environ.get("PAPER2_GPU_UTIL", "0.4"))
 MAX_MODEL_LEN = int(os.environ.get("PAPER2_MAX_LEN", "32000"))
 N_TURNS = int(os.environ.get("PAPER2_N_TURNS", "5"))
 OBS_CHARS = int(os.environ.get("PAPER2_OBS_CHARS", "4000"))
+KEEP_LAST_N = int(os.environ.get("PAPER2_KEEP_LAST_N", "0"))
 MEMENTO_TEXT = "[masked obs] file had 50 functions, 12 classes, key entrypoint at line 42"
 
 
@@ -81,6 +82,7 @@ def run(label: str, masking: bool) -> dict:
         gpu_memory_utilization=GPU_MEM_UTIL,
         max_model_len=MAX_MODEL_LEN,
         masking_enabled=masking,
+        keep_last_n_blocks=KEEP_LAST_N,
         debug_masking=False,
     )
     msgs = _make_messages(N_TURNS, OBS_CHARS, with_memento=masking)
