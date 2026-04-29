@@ -43,13 +43,19 @@ KEEP_LAST_N = int(os.environ.get("PAPER2_KEEP_LAST_N", "0"))
 MEMENTO_TEXT = "[masked obs] file had 50 functions, 12 classes, key entrypoint at line 42"
 
 
-def _make_messages(n_turns: int, obs_chars: int, with_memento: bool):
+def _make_messages(n_turns: int, obs_chars: int, with_memento: bool, last_only: bool = False):
     """Build a synthetic conversation with n_turns of tool calls + obs.
 
     Each turn: user asks something, assistant calls a tool, tool returns
     `obs_chars` of repeated text. With masking on, each tool message
     gets a `memento` field that the adapter expands into block + summary
     tokens.
+
+    If last_only=True and with_memento=True, only the FINAL tool message
+    gets markers; earlier ones are rendered as plain text. Tests whether
+    the multi-turn slowdown is caused by cascading rewinds (5 markers
+    in prompt → engine rewinds to earliest summary_start → re-prefills
+    everything after).
     """
     msgs = [{"role": "user", "content": "Read the codebase and summarize the architecture."}]
     obs_filler = ("def function_n(): pass\n# This is filler line for measurement.\n" * (obs_chars // 70))[:obs_chars]
@@ -68,15 +74,19 @@ def _make_messages(n_turns: int, obs_chars: int, with_memento: bool):
             "tool_call_id": f"tc_{i}",
             "content": f"[file src/module_{i}.py, {obs_chars} chars]\n{obs_filler}",
         }
-        if with_memento:
+        is_last_tool = (i == n_turns - 1)
+        if with_memento and (not last_only or is_last_tool):
             tool_msg["memento"] = MEMENTO_TEXT
         msgs.append(tool_msg)
     msgs.append({"role": "user", "content": "Now produce a one-sentence summary of the codebase."})
     return msgs
 
 
+LAST_ONLY = os.environ.get("PAPER2_LAST_ONLY", "0") == "1"
+
+
 def run(label: str, masking: bool) -> dict:
-    print(f"\n--- {label} (masking={masking}) ---")
+    print(f"\n--- {label} (masking={masking}, last_only={LAST_ONLY}) ---")
     model = MementoVLLMModel(
         model_name=MODEL,
         gpu_memory_utilization=GPU_MEM_UTIL,
@@ -85,7 +95,7 @@ def run(label: str, masking: bool) -> dict:
         keep_last_n_blocks=KEEP_LAST_N,
         debug_masking=False,
     )
-    msgs = _make_messages(N_TURNS, OBS_CHARS, with_memento=masking)
+    msgs = _make_messages(N_TURNS, OBS_CHARS, with_memento=masking, last_only=LAST_ONLY)
 
     # Warmup so cuda graphs / kernel autotuning don't taint the measurement.
     _ = model.chat(msgs, max_tokens=8)
