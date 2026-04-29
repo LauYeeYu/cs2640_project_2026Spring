@@ -10,8 +10,11 @@ from studies.lifetime_cost.paper2.adapters.memento_vllm import (
 
 
 def test_wrap_no_memento():
+    # No memento → plain text, no special tokens (avoids phantom-block cost).
     out = wrap_tool_message_for_masking("hello", None)
-    assert out == "<tool_response>\nhello\n</tool_response>"
+    assert out == "[tool_response]\nhello"
+    assert "<tool_response>" not in out
+    assert SUMMARY_START_STR not in out
 
 
 def test_wrap_with_memento():
@@ -41,7 +44,9 @@ def test_transform_tool_no_memento():
     assert len(out) == 2
     assert out[0] == msgs[0]
     assert out[1]["role"] == "user"
-    assert out[1]["content"] == "<tool_response>\nobs\n</tool_response>"
+    # Plain text — no <tool_response> tokens that would phantom-trigger the masker.
+    assert out[1]["content"] == "[tool_response]\nobs"
+    assert "<tool_response>" not in out[1]["content"]
 
 
 def test_transform_tool_with_memento():
@@ -73,9 +78,10 @@ def test_wrap_inlined_with_memento():
 
 def test_wrap_inlined_no_memento_falls_back_to_obs():
     out = wrap_tool_message_inlined("the obs", None)
-    # No memento yet → emit the obs (still wrapped so the engine sees a
-    # block_start..block_end pair, but no summary → no compaction).
-    assert "<tool_response>" in out
+    # No memento → plain text with no markers; we don't want to feed
+    # phantom blocks to the masking processor.
+    assert "<tool_response>" not in out
+    assert SUMMARY_START_STR not in out
     assert "the obs" in out
 
 

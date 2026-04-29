@@ -48,32 +48,35 @@ SUMMARY_END_STR = "<|fim_middle|>"
 def wrap_tool_message_for_masking(obs: str, memento: Optional[str]) -> str:
     """Render tool obs + optional memento as a single user-role payload.
 
-    With memento: the engine sees block_end immediately followed by
-    summary_start..summary_end and triggers compaction of the obs content.
+    With memento: full block + summary markers. Engine sees block_start..
+    block_end..summary_start..summary_end and fires compaction.
 
-    Without memento: standard `<tool_response>` wrapping; no compaction
-    fires (no summary block).
+    Without memento: plain text with no special tokens. The engine sees
+    no block at all — no markers, no bookkeeping. Use this path when the
+    obs is small enough that masking isn't worth it.
     """
-    body = f"<tool_response>\n{obs}\n</tool_response>"
     if memento:
-        body += f"{SUMMARY_START_STR}{memento}{SUMMARY_END_STR}"
-    return body
+        return (
+            f"<tool_response>\n{obs}\n</tool_response>"
+            f"{SUMMARY_START_STR}{memento}{SUMMARY_END_STR}"
+        )
+    # No memento → no markers (avoid Qwen3 tokenizing <tool_response> as the
+    # special 151665 token, which would make the engine track a phantom block
+    # that never fires compaction but still consumes processor cycles).
+    return f"[tool_response]\n{obs}"
 
 
 def wrap_tool_message_inlined(obs: str, memento: Optional[str]) -> str:
-    """Render an older tool message as PLAIN text (no markers).
+    """Render an older tool message as plain text — never with markers.
 
-    For the last-only recipe: every earlier tool message in a multi-turn
-    conversation gets rendered as a plain user message containing only the
-    memento text (the obs is already evicted from KV by a prior turn's
-    compaction, so there's no need to re-mark it). This avoids cascading
-    re-compaction in the engine.
-
-    Falls back to the obs itself if no memento was generated yet.
+    Older turns under last_only_masking should never re-trigger the
+    masking processor. Emit memento text if available, else fall back to
+    the obs itself, but in either case use plain text with no special
+    tokens (no `<tool_response>` literal, no summary delimiters).
     """
     if memento:
         return f"[tool_response, evicted, memento]\n{memento}"
-    return f"<tool_response>\n{obs}\n</tool_response>"
+    return f"[tool_response]\n{obs}"
 
 
 def transform_messages(
