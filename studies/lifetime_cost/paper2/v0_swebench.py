@@ -42,6 +42,8 @@ MIN_OBS_CHARS = int(os.environ.get("PAPER2_MIN_OBS_CHARS", "300"))
 MAX_STEPS = int(os.environ.get("PAPER2_MAX_STEPS", "20"))
 GPU_MEM_UTIL = float(os.environ.get("PAPER2_GPU_UTIL", "0.92"))
 MAX_MODEL_LEN = int(os.environ.get("PAPER2_MAX_LEN", "65000"))
+N_SEEDS = int(os.environ.get("PAPER2_N_SEEDS", "1"))
+TEMPERATURE = float(os.environ.get("PAPER2_TEMPERATURE", "0.0"))
 OUT_DIR = Path(os.environ.get("PAPER2_OUT_DIR", "/home/vlad/adaptivecache-paper2/studies/lifetime_cost/paper2/out_v0_swebench"))
 
 
@@ -59,14 +61,15 @@ def _summarize_step(step, idx, max_msg_chars=400):
             print(f"    tool_call: {fn.get('name')!r}({fn.get('arguments')!r})")
 
 
-def _run_one_task(task, *, masking: bool, label: str):
-    print(f"\n--- {label} on {task.id} ---")
+def _run_one_task(task, *, masking: bool, label: str, seed: int = 0, temperature: float = 0.0):
+    print(f"\n--- {label} on {task.id} (seed={seed}, T={temperature}) ---")
     model = MementoVLLMModel(
         model_name=MODEL,
         gpu_memory_utilization=GPU_MEM_UTIL,
         max_model_len=MAX_MODEL_LEN,
         masking_enabled=masking,
         debug_masking=False,
+        temperature=temperature,
     )
     policy = MementoPolicy(min_obs_chars=MIN_OBS_CHARS) if masking else NoCompaction()
     t0 = time.perf_counter()
@@ -79,7 +82,8 @@ def _run_one_task(task, *, masking: bool, label: str):
     )
     wall_total_ms = int((time.perf_counter() - t0) * 1000)
 
-    out_path = OUT_DIR / f"{label}_{task.id.replace('/', '_')}.json"
+    suffix = f"_seed{seed}" if seed else ""
+    out_path = OUT_DIR / f"{label}_{task.id.replace('/', '_')}{suffix}.json"
     with open(out_path, "w") as f:
         json.dump(traj.to_dict(), f, indent=2, default=str)
 
@@ -89,6 +93,8 @@ def _run_one_task(task, *, masking: bool, label: str):
     return {
         "task_id": task.id,
         "label": label,
+        "seed": seed,
+        "temperature": temperature,
         "steps": len(traj.steps),
         "resolved": traj.resolved,
         "chat_wall_ms": chat_wall,
@@ -119,11 +125,13 @@ def main():
 
     rows = []
     if do_baseline:
-        for task in tasks:
-            rows.append(_run_one_task(task, masking=False, label="baseline"))
+        for seed in range(N_SEEDS):
+            for task in tasks:
+                rows.append(_run_one_task(task, masking=False, label="baseline", seed=seed, temperature=TEMPERATURE))
     if do_memento:
-        for task in tasks:
-            rows.append(_run_one_task(task, masking=True, label="memento"))
+        for seed in range(N_SEEDS):
+            for task in tasks:
+                rows.append(_run_one_task(task, masking=True, label="memento", seed=seed, temperature=TEMPERATURE))
 
     # Save aggregate + print pivot
     summary_path = OUT_DIR / "summary.json"
