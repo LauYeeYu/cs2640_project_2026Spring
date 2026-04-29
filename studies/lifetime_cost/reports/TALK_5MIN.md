@@ -6,7 +6,9 @@
 
 ## Slide 1 — Hook + thesis (0:00 → 0:50)
 
-**Visual:** title slide. One sentence: *"Long-running LLM agents pay a cliff tax. Can we beat it with smart compaction?"* Below it: `fig6_project_arc.png` (small).
+**Visual:** title slide. One sentence: *"Long-running LLM agents pay a cliff tax. Can we beat it with smart compaction?"* Below it: project arc.
+
+![Project arc — measurement → empirical → mechanism → portability](figures/fig6_project_arc.png)
 
 **Say:**
 
@@ -18,7 +20,9 @@
 
 ## Slide 2 — What we built + the cliff tax (0:50 → 1:50)
 
-**Visual:** `fig5_cliff_amplification.png`.
+**Visual:** the cliff tax — 10× cost amplification per compaction event.
+
+![Cliff tax — 10× cost amplification per compaction event](figures/fig5_cliff_amplification.png)
 
 **Say:**
 
@@ -32,7 +36,9 @@
 
 ## Slide 3 — Where compaction DOES win (1:50 → 2:50)
 
-**Visual:** `fig7_compaction_wins.png`.
+**Visual:** Pareto wins at small N — Haiku (left) and Qwen (right).
+
+![Where compaction DOES win — Pareto wins at small N](figures/fig7_compaction_wins.png)
 
 **Say:**
 
@@ -44,7 +50,9 @@
 
 ## Slide 4 — The mechanism finding (2:50 → 3:50)
 
-**Visual:** `fig3_placeholder_ablation.png`.
+**Visual:** placeholder-design ablation on `pytest-7490` across two seeds.
+
+![Placeholder-design ablation — pytest-7490 mechanism replicates across seeds](figures/fig3_placeholder_ablation.png)
 
 **Say:**
 
@@ -62,7 +70,10 @@
 
 ## Slide 5 — The cliff wins at scale, and what's next (3:50 → 5:00)
 
-**Visual:** `fig1_pareto_swebench.png` left half, `fig2_cost_decomposition.png` right half — or just fig1.
+**Visual:** at N=10, no compaction policy Pareto-beats `none`.
+
+![SWE-bench Lite N=10 — `none` Pareto-dominates every compaction policy](figures/fig1_pareto_swebench.png)
+![Cost decomposition — input_uncached dominates because cliffs invalidate cache](figures/fig2_cost_decomposition.png)
 
 **Say:**
 
