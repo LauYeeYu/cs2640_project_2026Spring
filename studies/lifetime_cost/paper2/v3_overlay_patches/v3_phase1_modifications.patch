@@ -1,8 +1,8 @@
 diff --git a/vllm/vllm/config/block_masking.py b/vllm/vllm/config/block_masking.py
-index fda9f45..103fd38 100644
+index fda9f45..71bb7c2 100644
 --- a/vllm/vllm/config/block_masking.py
 +++ b/vllm/vllm/config/block_masking.py
-@@ -121,7 +121,14 @@ class BlockMaskingConfig:
+@@ -121,7 +121,26 @@ class BlockMaskingConfig:
      0 = disabled (no cap). When > 0, a logits processor will force the model
      to generate <|block_end|> once a block reaches this many content tokens."""
      debug: bool = False
@@ -14,6 +14,18 @@ index fda9f45..103fd38 100644
 +    deterministic memento_id. The store can then be queried via
 +    `vllm.v1.core.block_masking.global_memento_store()` to verify capture
 +    bytes and (in Phase 3) splice them back into a future request."""
++
++    attention_mask_mode: bool = False
++    """Paper 2 v4 (Path 3). When True, compact_kv_cache no longer physically
++    moves active KV down or frees obs blocks. Instead it adds the obs block
++    IDs to Request.masked_block_ids — those blocks stay alive in the
++    block_pool (refcount-pinned via Phase 4a) and the attention path
++    filters them out of paged_kv_indices so the model can't see them.
++    Recall is then a constant-time set removal: drop the block IDs from
++    masked_block_ids and the next forward pass attends to them again.
++    Suffix tokens never shift positions → prefix cache hits everything,
++    no cliff. Trade-off: GPU memory grows linearly with conversation
++    length since obs blocks are never freed."""
 +
      # Resolved token IDs (set during initialization)
      _block_start_id: Optional[int] = field(default=None, repr=False)
@@ -49,15 +61,16 @@ index 37c8bbd..0db2f3e 100644
 +    "reset_global_memento_store",
  ]
 diff --git a/vllm/vllm/v1/core/kv_cache_coordinator.py b/vllm/vllm/v1/core/kv_cache_coordinator.py
-index d8acac0..0571b67 100644
+index d8acac0..4c0ff07 100644
 --- a/vllm/vllm/v1/core/kv_cache_coordinator.py
 +++ b/vllm/vllm/v1/core/kv_cache_coordinator.py
-@@ -209,29 +209,33 @@ class KVCacheCoordinator(ABC):
+@@ -209,29 +209,36 @@ class KVCacheCoordinator(ABC):
          self,
          request_id: str,
          active_physical_positions: list[int],
 -    ) -> tuple[int, list[tuple[int, int, int, int]]]:
 +        capture_specs: "list | None" = None,
++        attention_mask_mode: bool = False,
 +    ) -> tuple[int, list[tuple[int, int, int, int]], list]:
          """
          Physically compact KV cache by copying active tokens to contiguous slots.
@@ -84,7 +97,9 @@ index d8acac0..0571b67 100644
 -            freed, copy_ops = manager.compact_kv_cache(
 -                request_id, active_physical_positions
 +            freed, copy_ops, capture_ops = manager.compact_kv_cache(
-+                request_id, active_physical_positions, capture_specs=capture_specs,
++                request_id, active_physical_positions,
++                capture_specs=capture_specs,
++                attention_mask_mode=attention_mask_mode,
              )
              total_freed += freed
              all_copy_ops.extend(copy_ops)
@@ -95,15 +110,16 @@ index d8acac0..0571b67 100644
      @abstractmethod
      def find_longest_cache_hit(
 diff --git a/vllm/vllm/v1/core/kv_cache_manager.py b/vllm/vllm/v1/core/kv_cache_manager.py
-index 3297434..387a952 100644
+index 3297434..612403e 100644
 --- a/vllm/vllm/v1/core/kv_cache_manager.py
 +++ b/vllm/vllm/v1/core/kv_cache_manager.py
-@@ -431,14 +431,16 @@ class KVCacheManager:
+@@ -431,14 +431,17 @@ class KVCacheManager:
          self,
          request_id: str,
          active_physical_positions: list[int],
 -    ) -> tuple[int, list[tuple[int, int, int, int]]]:
 +        capture_specs: "list | None" = None,
++        attention_mask_mode: bool = False,
 +    ) -> tuple[int, list[tuple[int, int, int, int]], list]:
          """
          Physically compact KV cache by copying active tokens to contiguous slots.
@@ -119,7 +135,7 @@ index 3297434..387a952 100644
  
          Args:
              request_id: The request ID.
-@@ -446,11 +448,16 @@ class KVCacheManager:
+@@ -446,11 +449,18 @@ class KVCacheManager:
                  that are active. The caller (scheduler) is responsible for
                  converting logical to physical positions via
                  request.logical_to_physical().
@@ -137,7 +153,9 @@ index 3297434..387a952 100644
          """
          return self.coordinator.compact_kv_cache(
 -            request_id, active_physical_positions
-+            request_id, active_physical_positions, capture_specs=capture_specs,
++            request_id, active_physical_positions,
++            capture_specs=capture_specs,
++            attention_mask_mode=attention_mask_mode,
          )
 diff --git a/vllm/vllm/v1/core/sched/output.py b/vllm/vllm/v1/core/sched/output.py
 index db7a4d2..80e5e79 100644
@@ -166,7 +184,7 @@ index db7a4d2..80e5e79 100644
      # for block table truncation after compaction.
      block_table_truncations: dict[str, tuple[int, ...]] | None = None
 diff --git a/vllm/vllm/v1/core/sched/scheduler.py b/vllm/vllm/v1/core/sched/scheduler.py
-index 6b0d8fe..671dec3 100644
+index 6b0d8fe..c0bc657 100644
 --- a/vllm/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/vllm/v1/core/sched/scheduler.py
 @@ -185,6 +185,19 @@ class Scheduler(SchedulerInterface):
@@ -248,10 +266,46 @@ index 6b0d8fe..671dec3 100644
                      )
                      if (self.block_masking_config is not None and
                          self.block_masking_config.debug):
-@@ -1759,11 +1796,119 @@ class Scheduler(SchedulerInterface):
+@@ -1759,11 +1796,155 @@ class Scheduler(SchedulerInterface):
                  merged.append((start, end))
          return merged
  
++    def unmask_blocks_for_recall(
++        self, request_id: str, memento_id: str,
++    ) -> "tuple[bool, str]":
++        """Paper 2 v4 Phase 4d: recall via mask removal.
++
++        Looks up the memento in the scheduler-side store, finds its pinned
++        GPU block IDs, and removes them from the named request's
++        masked_block_ids set. The next attention forward for that request
++        will INCLUDE those blocks (paged_kv_indices filter no longer skips
++        them). KV bytes are unchanged — recall is just a set membership flip.
++
++        Returns (ok, message). Common failure modes:
++          - request_id unknown
++          - memento_id unknown or not pinned
++          - blocks weren't in the request's masked set (no-op)
++        """
++        request = self.requests.get(request_id)
++        if request is None:
++            return False, f"unknown request_id={request_id!r}"
++
++        from vllm.v1.core.block_masking.memento_store import (
++            global_memento_store as _gms,
++        )
++        sched_store = _gms()
++        m = sched_store.get(memento_id)
++        if m is None:
++            return False, f"unknown memento_id={memento_id!r}"
++        if not m.gpu_pinned_block_ids:
++            return False, f"memento {memento_id!r} not GPU-pinned"
++
++        before = len(request.masked_block_ids)
++        for bid in m.gpu_pinned_block_ids:
++            request.masked_block_ids.discard(bid)
++        removed = before - len(request.masked_block_ids)
++        return True, f"unmasked {removed} blocks for recall"
++
 +    def release_pinned_memento(self, memento_id: str) -> "tuple[bool, str]":
 +        """Phase 4a inverse: drop ref_cnt on pinned GPU blocks for memento_id.
 +
@@ -368,7 +422,7 @@ index 6b0d8fe..671dec3 100644
      ) -> SpanRemovalResult:
          """Mask a span of tokens and compact the KV cache in one step.
  
-@@ -1776,6 +1921,11 @@ class Scheduler(SchedulerInterface):
+@@ -1776,6 +1957,11 @@ class Scheduler(SchedulerInterface):
              request_id: The request ID.
              start_position: Start logical position (inclusive).
              end_position: End logical position (exclusive).
@@ -380,7 +434,7 @@ index 6b0d8fe..671dec3 100644
  
          Returns:
              SpanRemovalResult with success status, tokens removed, and
-@@ -1854,16 +2004,61 @@ class Scheduler(SchedulerInterface):
+@@ -1854,16 +2040,78 @@ class Scheduler(SchedulerInterface):
              request.logical_to_physical(p) for p in active_logical
          ]
  
@@ -399,14 +453,31 @@ index 6b0d8fe..671dec3 100644
 +                logical_range=(start_position, end_position),
 +            )]
 +
++        # Phase 4b: when block_masking_config.attention_mask_mode is True,
++        # tell compact_kv_cache to skip physical compaction. The captured
++        # blocks stay in the request's block_table; we add their block IDs
++        # to request.masked_block_ids and Phase 4c (the FlashInfer metadata
++        # builder) filters them out of paged_kv_indices.
++        attention_mask_mode = (
++            self.block_masking_config is not None
++            and getattr(self.block_masking_config, "attention_mask_mode", False)
++        )
++
          # Perform physical compaction in KV cache manager.
 -        blocks_freed, copy_ops = self.kv_cache_manager.compact_kv_cache(
 +        blocks_freed, copy_ops, capture_ops = self.kv_cache_manager.compact_kv_cache(
              request_id,
              active_physical,
 +            capture_specs=capture_specs,
++            attention_mask_mode=attention_mask_mode,
          )
  
++        # In v4 mode, populate request.masked_block_ids so the attention
++        # path knows which blocks to filter out for this request.
++        if attention_mask_mode and capture_ops:
++            for op in capture_ops:
++                request.masked_block_ids.update(op.src_block_ids)
++
          # Store copy operations to be sent to worker.
          if copy_ops:
              self.pending_kv_copy_operations[request_id] = copy_ops
@@ -444,20 +515,21 @@ index 6b0d8fe..671dec3 100644
          num_active = len(active_physical)
          blocks_needed = (num_active + self.block_size - 1) // self.block_size
 diff --git a/vllm/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/vllm/v1/core/single_type_kv_cache_manager.py
-index de7ce2e..ffc7751 100644
+index de7ce2e..3d24450 100644
 --- a/vllm/vllm/v1/core/single_type_kv_cache_manager.py
 +++ b/vllm/vllm/v1/core/single_type_kv_cache_manager.py
-@@ -304,7 +304,8 @@ class SingleTypeKVCacheManager(ABC):
+@@ -304,7 +304,9 @@ class SingleTypeKVCacheManager(ABC):
          self,
          request_id: str,
          active_physical_positions: list[int],
 -    ) -> tuple[int, list[tuple[int, int, int, int]]]:
 +        capture_specs: "list | None" = None,
++        attention_mask_mode: bool = False,
 +    ) -> tuple[int, list[tuple[int, int, int, int]], list]:
          """
          Physically compact KV cache by copying active tokens to contiguous slots.
  
-@@ -322,17 +323,56 @@ class SingleTypeKVCacheManager(ABC):
+@@ -322,17 +324,56 @@ class SingleTypeKVCacheManager(ABC):
                  that are active. The caller (scheduler) is responsible for
                  converting logical positions to physical positions via
                  request.logical_to_physical().
@@ -518,7 +590,7 @@ index de7ce2e..ffc7751 100644
  
          # Build copy plan: list of (src_slot, dst_slot) pairs
          # where src_slot is the current physical location of an active token
-@@ -368,11 +408,28 @@ class SingleTypeKVCacheManager(ABC):
+@@ -368,11 +409,52 @@ class SingleTypeKVCacheManager(ABC):
          # Truncate the blocks list
          del blocks[blocks_needed:]
  
@@ -540,6 +612,30 @@ index de7ce2e..ffc7751 100644
 +                  f"{[op.memento_id for op in capture_operations]}",
 +                  flush=True)
 +
++        # Phase 4b: in attention-mask mode, do NOT physically free obs
++        # blocks. They stay in the request's block_table at original
++        # positions — the attention path will filter them out via
++        # Request.masked_block_ids (Phase 4c). This means:
++        #   - copy_operations is discarded (no physical move)
++        #   - blocks_to_free is discarded (blocks stay pinned)
++        #   - blocks_freed reports as 0 (we didn't actually free anything)
++        #   - the caller (scheduler) will populate request.masked_block_ids
++        #     with pinned_block_ids so the attention path skips them
++        # Phase 4c lives in FlashInferMetadataBuilder where paged_kv_indices
++        # is built — it consults masked_block_ids and emits a filtered list.
++        if attention_mask_mode and capture_operations:
++            print(f"[v4-mask] attention_mask_mode=True — skipping physical "
++                  f"compaction; {len(pinned_block_ids)} blocks will be "
++                  f"masked via paged_kv_indices filtering",
++                  flush=True)
++            # Re-populate the blocks list with the originally-pinned blocks
++            # so they remain part of the request's block_table at their
++            # original positions (we did `del blocks[blocks_needed:]` above
++            # which truncated them away).
++            for block in blocks_to_free:
++                blocks.append(block)
++            return 0, [], capture_operations
++
 +        # Free the blocks (decrements ref_cnt; pinned blocks survive).
          if blocks_to_free:
              self.block_pool.free_blocks(reversed(blocks_to_free))
@@ -549,6 +645,25 @@ index de7ce2e..ffc7751 100644
  
      def _get_kv_copy_ops(
          self,
+diff --git a/vllm/vllm/v1/request.py b/vllm/vllm/v1/request.py
+index 09302a7..3400f96 100644
+--- a/vllm/vllm/v1/request.py
++++ b/vllm/vllm/v1/request.py
+@@ -151,6 +151,14 @@ class Request:
+         # Initialized by the scheduler if block masking is enabled.
+         self.block_masking_state: Optional["BlockMaskingState"] = None
+ 
++        # Paper 2 v4 Phase 4b: per-request set of physical block IDs that
++        # are LOGICALLY MASKED from attention (but still alive in the
++        # block_pool, refcount-pinned via Phase 4a). The attention path
++        # filters these out of paged_kv_indices so the model doesn't see
++        # them — equivalent to Memento's compaction semantics but WITHOUT
++        # physically moving KV. Recall = remove block IDs from this set.
++        self.masked_block_ids: set[int] = set()
++
+     @classmethod
+     def from_engine_core_request(
+         cls,
 diff --git a/vllm/vllm/v1/worker/gpu_model_runner.py b/vllm/vllm/v1/worker/gpu_model_runner.py
 index f677b37..aa57eb8 100644
 --- a/vllm/vllm/v1/worker/gpu_model_runner.py
