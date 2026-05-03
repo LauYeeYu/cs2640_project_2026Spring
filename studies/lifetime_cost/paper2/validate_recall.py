@@ -201,6 +201,15 @@ def _run(task, model, *, variant: str, seed: int = 0):
 
 def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Phase 4d-diag: tell the engine subprocess where to dump its
+    # ENGINE_STATS counters at process exit. Must be set BEFORE the
+    # MementoVLLMModel constructor builds the engine (which forks the
+    # worker subprocess; the env var propagates).
+    engine_stats_path = OUT_DIR / "v4_engine_stats.jsonl"
+    os.environ["PAPER2_ENGINE_STATS_PATH"] = str(engine_stats_path)
+    print(f"engine_stats_path: {engine_stats_path}")
+
     bench = SWEBenchLive(
         instance_ids=INSTANCE_IDS,
         cache_dir="/scratch/swebench_repos",

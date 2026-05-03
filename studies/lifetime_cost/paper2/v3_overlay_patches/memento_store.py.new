@@ -16,10 +16,48 @@ records metadata only (cpu_kv may be None).
 
 from __future__ import annotations
 
+import atexit
+import json
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
+
+
+# Process-global engine-side counters. Incremented by the worker at the
+# call sites listed in the comment. Dumped to disk via atexit so we can
+# verify (post-bake) that v4 plumbing actually fired in the worker
+# subprocess — print() to worker stdout is unreliable under vLLM V1.
+ENGINE_STATS: dict[str, int] = {
+    "compactions_seen": 0,        # compact_kv_cache called (any mode)
+    "captures_built": 0,          # capture_operations populated by mgr
+    "pins_applied": 0,            # Phase 4a refcount++
+    "mask_short_circuits": 0,     # Phase 4b: physical compaction skipped
+    "block_table_filters": 0,     # Phase 4c: worker filtered N rows
+    "block_ids_filtered": 0,      # Phase 4c: total block IDs compacted-out
+    "kv_captures_executed": 0,    # worker did GPU→CPU copy
+    "kv_restores_executed": 0,    # worker did CPU→GPU copy
+}
+
+
+def _dump_engine_stats() -> None:
+    """Write ENGINE_STATS to ENGINE_STATS_PATH (env var). atexit hook."""
+    path = os.environ.get("PAPER2_ENGINE_STATS_PATH")
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # Tag with pid so multi-proc deploys don't clobber each other.
+        out = {"pid": os.getpid(), **ENGINE_STATS}
+        # Append-style write so each process gets its own line.
+        with open(path, "a") as f:
+            f.write(json.dumps(out) + "\n")
+    except Exception:  # pragma: no cover — diagnostic only
+        pass
+
+
+atexit.register(_dump_engine_stats)
 
 
 @dataclass
