@@ -122,6 +122,27 @@ class MementoVLLMModel(ChatModel):
     _engine_cache: Dict[Tuple, Any] = {}
     _tokenizer_cache: Dict[str, Any] = {}
 
+    def queue_recall(self, obs_text: str) -> Optional[str]:
+        """Phase 4e: tell the engine to skip masking the named obs on the
+        next compaction. Returns the obs_id (so the caller can verify).
+
+        The bridge: tokenize the obs (same way the engine sees it inside
+        the marker'd prompt), compute its content hash (same algorithm
+        as `_auto_memento_id`), append to the recall queue file. The
+        scheduler subprocess drains the file mid-compaction and skips
+        adding to `request.masked_block_ids` for that obs_id.
+        """
+        try:
+            from vllm.v1.core.block_masking import compute_obs_id, queue_recall
+        except Exception:
+            return None
+        token_ids = self._tokenizer(obs_text, add_special_tokens=False).input_ids
+        if not token_ids:
+            return None
+        obs_id = compute_obs_id(token_ids)
+        queue_recall(obs_id)
+        return obs_id
+
     def __init__(
         self,
         model_name: str,

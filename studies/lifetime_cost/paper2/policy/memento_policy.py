@@ -87,9 +87,17 @@ class MementoPolicy(CompactionPolicy):
             recall_strategy, **(recall_strategy_kwargs or {})
         )
         self._recall_query_window = recall_query_window
-        if recall_mode not in ("inplace", "append"):
-            raise ValueError(f"recall_mode must be 'inplace' or 'append', got {recall_mode!r}")
+        if recall_mode not in ("inplace", "append", "attmask"):
+            raise ValueError(
+                f"recall_mode must be 'inplace' | 'append' | 'attmask', got {recall_mode!r}"
+            )
         self._recall_mode = recall_mode
+        # Phase 4e: attmask mode stages obs_text payloads here. The runner
+        # drains this list before the next chat() call and asks the
+        # adapter to queue_recall(obs_text), which writes to the engine's
+        # IPC file. The engine then skips masking for that obs on its
+        # next compaction so attention can read it back.
+        self._pending_attmask_recalls: List[str] = []
         self._writer = writer or HaikuMementoWriter(
             model=memento_model, max_obs_chars=max_obs_chars
         )
@@ -319,6 +327,18 @@ class MementoPolicy(CompactionPolicy):
             # can restore it without re-paying Haiku.
             msg["prior_memento"] = msg.get("memento")
             msg["memento"] = None
+            msg["recalled_step"] = ctx.step
+            new_messages = messages
+        elif self._recall_mode == "attmask":
+            # v4 Phase 4e: keep memento + markers intact (so prefix cache
+            # hits across turns), but stage the obs_text for the runner
+            # to push into the engine's recall queue. On next chat()'s
+            # compaction the engine will SKIP adding this obs to the
+            # request's masked_block_ids — attention reads the obs from
+            # already-pinned KV. No re-prefill cost.
+            obs = msg.get("content") or ""
+            if obs:
+                self._pending_attmask_recalls.append(obs)
             msg["recalled_step"] = ctx.step
             new_messages = messages
         else:

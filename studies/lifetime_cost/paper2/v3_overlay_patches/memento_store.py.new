@@ -38,6 +38,7 @@ ENGINE_STATS: dict[str, int] = {
     "block_ids_filtered": 0,      # Phase 4c: total block IDs compacted-out
     "kv_captures_executed": 0,    # worker did GPU→CPU copy
     "kv_restores_executed": 0,    # worker did CPU→GPU copy
+    "recalls_via_unmask": 0,      # Phase 4e: obs_id consumed from recall queue
 }
 
 
@@ -70,6 +71,101 @@ def bump(key: str, n: int = 1) -> None:
     """Increment ENGINE_STATS[key] and persist immediately."""
     ENGINE_STATS[key] = ENGINE_STATS.get(key, 0) + n
     dump_engine_stats()
+
+
+# ---- Phase 4e: stable obs_id + recall queue ----
+# obs_id is derived from the obs token content: same obs across calls →
+# same id. This lets the policy address an obs across request_id changes,
+# and lets the scheduler do idempotent capture/pin (Phase 4e refinement).
+import hashlib as _hashlib
+
+
+def compute_obs_id(token_ids) -> str:
+    """Stable hash of obs tokens. Used as memento_id under v4 attmask.
+
+    Engine and policy/adapter compute this same way so they can refer to
+    the same obs across chat() calls (request_id changes; content stays).
+    """
+    h = _hashlib.sha256()
+    for t in token_ids:
+        h.update(int(t).to_bytes(4, "little", signed=False))
+    return f"obs:{h.hexdigest()[:16]}"
+
+
+_RECALL_QUEUE_PATH_DEFAULT = "/tmp/paper2_recall_queue.jsonl"
+
+
+def _recall_queue_path() -> str:
+    return os.environ.get(
+        "PAPER2_RECALL_QUEUE_PATH", _RECALL_QUEUE_PATH_DEFAULT
+    )
+
+
+def queue_recall(obs_id: str) -> None:
+    """Append obs_id to the recall queue file.
+
+    Cross-process channel: the engine subprocess reads + drains this on
+    each compaction. Adapter (main process) appends. Filesystem-based
+    so it survives the process boundary in vLLM V1 multi-proc deploy.
+    """
+    path = _recall_queue_path()
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps({"obs_id": obs_id}) + "\n")
+    except Exception:
+        pass
+
+
+def consume_recall(obs_id: str) -> bool:
+    """Atomic-ish: if obs_id is queued, remove it and return True.
+
+    Race-free in our use (single writer, single reader), but lock-free.
+    Reads the whole queue, drops one matching obs_id, rewrites the
+    remainder. Returns False if obs_id is not queued.
+    """
+    path = _recall_queue_path()
+    if not os.path.exists(path):
+        return False
+    queued: list[str] = []
+    found = False
+    try:
+        with open(path) as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                qid = rec.get("obs_id")
+                if not qid:
+                    continue
+                if qid == obs_id and not found:
+                    found = True  # drop the first match
+                    continue
+                queued.append(qid)
+    except Exception:
+        return False
+    if not found:
+        return False
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            for qid in queued:
+                f.write(json.dumps({"obs_id": qid}) + "\n")
+        os.replace(tmp, path)
+    except Exception:
+        pass
+    return True
+
+
+def reset_recall_queue() -> None:
+    """Test hook: drop the queue file."""
+    path = _recall_queue_path()
+    if os.path.exists(path):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
 
 
 # Backward-compat alias.

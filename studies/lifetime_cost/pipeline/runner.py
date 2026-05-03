@@ -118,6 +118,21 @@ def run_task(
         )
         messages, recall_event = policy.maybe_recall(messages, recall_ctx)
 
+        # Phase 4e: drain attmask recall hints staged by the policy and
+        # push them into the engine via the model adapter. Each entry is
+        # an obs_text whose obs_id we want skipped on the next compaction
+        # (so the masked KV is read by attention).
+        pending = getattr(policy, "_pending_attmask_recalls", None)
+        if pending:
+            queue_recall = getattr(model, "queue_recall", None)
+            if callable(queue_recall):
+                while pending:
+                    obs_text = pending.pop(0)
+                    try:
+                        queue_recall(obs_text)
+                    except Exception:
+                        pass
+
         t0 = time.perf_counter()
         resp = model.chat(
             messages,
