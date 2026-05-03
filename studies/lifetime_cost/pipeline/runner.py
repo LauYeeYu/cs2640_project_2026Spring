@@ -93,7 +93,12 @@ def run_task(
         policy=policy.name,
     )
 
-    messages = list(task.messages_init)
+    # Deep-copy task.messages_init: the policy may mutate message dicts
+    # (memento, prior_memento, recalled_step) and we must not let those
+    # mutations leak back to the shared task object — otherwise multi-variant
+    # bakes (validate_recall.py) see corrupted starting state across runs.
+    import copy
+    messages = copy.deepcopy(task.messages_init)
     tools_schema = task.tool_env.schemas() or None
 
     final_answer: Optional[str] = None

@@ -90,6 +90,14 @@ image = (
         "cd /opt/adaptivecache && bash studies/lifetime_cost/paper2/v3_overlay_patches/apply.sh",
         # Run the overlay installer — rsyncs .py files over vLLM in site-packages
         "cd /opt/adaptivecache/external/memento/vllm && bash install_overlay.sh",
+        # Nuke stale bytecode — pip pre-compiles vllm during install, and the
+        # rsync above only replaced .py files. With UNCHECKED_HASH .pyc mode
+        # Python may keep using the OLD bytecode for replaced files. Symptom:
+        # CachedRequestData() called without compacted_token_counts because
+        # only output.py got effectively reloaded but scheduler.py kept stale
+        # bytecode.
+        "find /usr/local/lib/python3.12/site-packages/vllm -name '__pycache__' "
+        "-type d -exec rm -rf {} + 2>/dev/null || true",
     )
     .env({
         "VLLM_ATTENTION_BACKEND": "FLASHINFER",
