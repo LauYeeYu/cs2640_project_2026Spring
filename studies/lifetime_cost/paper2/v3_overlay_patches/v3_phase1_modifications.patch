@@ -197,10 +197,10 @@ index db7a4d2..f0d6014 100644
      # block masking compactions. These requests will do prefill only,
      # allowing compaction to run before the first decode token.
 diff --git a/vllm/vllm/v1/core/sched/scheduler.py b/vllm/vllm/v1/core/sched/scheduler.py
-index 6b0d8fe..c0bc657 100644
+index 6b0d8fe..ec99df6 100644
 --- a/vllm/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/vllm/v1/core/sched/scheduler.py
-@@ -185,6 +185,19 @@ class Scheduler(SchedulerInterface):
+@@ -185,10 +185,30 @@ class Scheduler(SchedulerInterface):
              str, list[tuple[int, int, int, int]]
          ] = {}
  
@@ -220,7 +220,18 @@ index 6b0d8fe..c0bc657 100644
          # Block table truncation info after KV cache compaction.
          # Maps request_id -> tuple of num_blocks per KV cache group.
          self.pending_block_table_truncations: dict[str, tuple[int, ...]] = {}
-@@ -773,6 +786,22 @@ class Scheduler(SchedulerInterface):
+ 
++        # Phase 4c: per-step block-table filters. Maps request_id -> list of
++        # block IDs to compact-out of the worker's block_table for that
++        # request. Populated each step from request.masked_block_ids when
++        # attention_mask_mode is in use. Idempotent: re-sending the same set
++        # is harmless because the worker already filtered those blocks.
++        self.pending_block_table_filter_ops: dict[str, list[int]] = {}
++
+ 
+         # KV Connector: requests in process of async KV loading or recving
+         self.finished_recving_kv_req_ids: set[str] = set()
+@@ -773,6 +793,42 @@ class Scheduler(SchedulerInterface):
          )
          self.pending_block_table_truncations.clear()
  
@@ -240,19 +251,41 @@ index 6b0d8fe..c0bc657 100644
 +        )
 +        self.pending_kv_restore_operations.clear()
 +
++        # Phase 4c: build block_table_filter_ops from each running/resumed
++        # request's masked_block_ids. We re-emit on every step (idempotent
++        # at the worker — once a block ID is gone from block_table.np, the
++        # filter is a no-op). Cheaper than tracking per-request
++        # "already-emitted" state, and self-healing across worker restarts.
++        block_table_filter_ops: dict[str, list[int]] | None = None
++        # Populator: walk requests with masked_block_ids and emit the filter.
++        # Use scheduled set to avoid emitting for requests not currently in
++        # the input batch (where req_id_to_index would miss).
++        for req_id in num_scheduled_tokens.keys():
++            request = self.requests.get(req_id)
++            if request is None:
++                continue
++            masked = getattr(request, "masked_block_ids", None)
++            if not masked:
++                continue
++            if block_table_filter_ops is None:
++                block_table_filter_ops = {}
++            block_table_filter_ops[req_id] = list(masked)
++
          # Block masking: Detect requests with pending compactions that are
          # about to transition from prefill to decode. These should skip
          # sampling so compaction can run before the first decode token.
-@@ -816,6 +845,8 @@ class Scheduler(SchedulerInterface):
+@@ -816,7 +872,10 @@ class Scheduler(SchedulerInterface):
              finished_req_ids=self.finished_req_ids,
              free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
              kv_copy_operations=kv_copy_operations,
 +            kv_capture_operations=kv_capture_operations,
 +            kv_restore_operations=kv_restore_operations,
              block_table_truncations=block_table_truncations,
++            block_table_filter_ops=block_table_filter_ops,
              skip_sampling_req_ids=skip_sampling_req_ids,
          )
-@@ -1259,6 +1290,8 @@ class Scheduler(SchedulerInterface):
+ 
+@@ -1259,6 +1318,8 @@ class Scheduler(SchedulerInterface):
                              request.request_id,
                              start,
                              end,
@@ -261,7 +294,7 @@ index 6b0d8fe..c0bc657 100644
                          )
                          if (self.block_masking_config is not None and
                              self.block_masking_config.debug):
-@@ -1469,6 +1502,8 @@ class Scheduler(SchedulerInterface):
+@@ -1469,6 +1530,8 @@ class Scheduler(SchedulerInterface):
                          request.request_id,
                          start,
                          end,
@@ -270,7 +303,7 @@ index 6b0d8fe..c0bc657 100644
                      )
                      if (self.block_masking_config is not None and
                          self.block_masking_config.debug):
-@@ -1510,6 +1545,8 @@ class Scheduler(SchedulerInterface):
+@@ -1510,6 +1573,8 @@ class Scheduler(SchedulerInterface):
                          request.request_id,
                          start,
                          end,
@@ -279,7 +312,7 @@ index 6b0d8fe..c0bc657 100644
                      )
                      if (self.block_masking_config is not None and
                          self.block_masking_config.debug):
-@@ -1759,11 +1796,155 @@ class Scheduler(SchedulerInterface):
+@@ -1759,11 +1824,155 @@ class Scheduler(SchedulerInterface):
                  merged.append((start, end))
          return merged
  
@@ -435,7 +468,7 @@ index 6b0d8fe..c0bc657 100644
      ) -> SpanRemovalResult:
          """Mask a span of tokens and compact the KV cache in one step.
  
-@@ -1776,6 +1957,11 @@ class Scheduler(SchedulerInterface):
+@@ -1776,6 +1985,11 @@ class Scheduler(SchedulerInterface):
              request_id: The request ID.
              start_position: Start logical position (inclusive).
              end_position: End logical position (exclusive).
@@ -447,7 +480,7 @@ index 6b0d8fe..c0bc657 100644
  
          Returns:
              SpanRemovalResult with success status, tokens removed, and
-@@ -1854,16 +2040,78 @@ class Scheduler(SchedulerInterface):
+@@ -1854,20 +2068,89 @@ class Scheduler(SchedulerInterface):
              request.logical_to_physical(p) for p in active_logical
          ]
  
@@ -525,8 +558,22 @@ index 6b0d8fe..c0bc657 100644
 +                ))
 +
          # Store block table truncation info for the worker.
-         num_active = len(active_physical)
-         blocks_needed = (num_active + self.block_size - 1) // self.block_size
+-        num_active = len(active_physical)
+-        blocks_needed = (num_active + self.block_size - 1) // self.block_size
+-        self.pending_block_table_truncations[request_id] = (blocks_needed,)
++        # Phase 4c: in attention_mask_mode the block_pool kept the obs blocks
++        # (Phase 4a refcount pin) and compact_kv_cache returned without
++        # touching the blocks list, so the request's full block_table is
++        # still load-bearing. A truncation here would chop off the pinned
++        # obs blocks at the tail. Block-table cleanup happens via the
++        # filter_ops path instead (compacts out specific block IDs).
++        if not (attention_mask_mode and capture_ops):
++            num_active = len(active_physical)
++            blocks_needed = (num_active + self.block_size - 1) // self.block_size
++            self.pending_block_table_truncations[request_id] = (blocks_needed,)
+ 
+         # Now merge the new span into compacted_spans.
+         request.compacted_spans = self._merge_spans(
 diff --git a/vllm/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/vllm/v1/core/single_type_kv_cache_manager.py
 index de7ce2e..3d24450 100644
 --- a/vllm/vllm/v1/core/single_type_kv_cache_manager.py
@@ -678,7 +725,7 @@ index 09302a7..3400f96 100644
      def from_engine_core_request(
          cls,
 diff --git a/vllm/vllm/v1/worker/gpu_model_runner.py b/vllm/vllm/v1/worker/gpu_model_runner.py
-index f677b37..aa57eb8 100644
+index f677b37..ca46f3b 100644
 --- a/vllm/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/vllm/v1/worker/gpu_model_runner.py
 @@ -866,6 +866,22 @@ class GPUModelRunner(
@@ -704,7 +751,51 @@ index f677b37..aa57eb8 100644
          # Execute KV cache copy operations for compaction BEFORE updating block tables.
          # These physically move KV values to compact the cache after span removal.
          if scheduler_output.kv_copy_operations:
-@@ -1041,6 +1057,206 @@ class GPUModelRunner(
+@@ -880,6 +896,43 @@ class GPUModelRunner(
+                 if req_index is not None:
+                     self.input_batch.block_table.truncate_row(req_index, num_blocks)
+ 
++        # Phase 4c: apply block-table FILTERS for attention-mask-mode
++        # compactions. Removes specific block IDs from arbitrary positions
++        # in the request's block_table and compacts remaining entries left.
++        # Idempotent — once a block ID is gone from block_table.np, repeat
++        # filter ops are no-ops.
++        # Uses np.isin to compute a mask over the live row, then writes back
++        # the surviving entries in original order. Updates num_blocks_per_row.
++        # compacted_tokens_cpu is NOT updated here — the scheduler-side
++        # request.compacted_spans already accounts for the masked tokens
++        # and ships the right value via CachedRequestData.compacted_token_counts.
++        if getattr(scheduler_output, "block_table_filter_ops", None):
++            import numpy as _np
++            mgr_block_table = self.input_batch.block_table
++            for req_id, block_ids_to_remove in (
++                scheduler_output.block_table_filter_ops.items()
++            ):
++                req_index = self.input_batch.req_id_to_index.get(req_id)
++                if req_index is None:
++                    continue
++                if not block_ids_to_remove:
++                    continue
++                to_remove = _np.asarray(block_ids_to_remove, dtype=_np.int32)
++                # Filter every KV-cache group's block_table for this request.
++                for group_bt in mgr_block_table.block_tables:
++                    n = int(group_bt.num_blocks_per_row[req_index])
++                    if n == 0:
++                        continue
++                    row_np = group_bt.block_table.np
++                    live = row_np[req_index, :n]
++                    keep_mask = ~_np.isin(live, to_remove)
++                    new_n = int(keep_mask.sum())
++                    if new_n == n:
++                        continue  # no match — already filtered or different group
++                    # Compact survivors left, preserving order.
++                    row_np[req_index, :new_n] = live[keep_mask]
++                    group_bt.num_blocks_per_row[req_index] = new_n
++
+         # Wait until valid_sampled_tokens_count is copied to cpu,
+         # then use it to update actual num_computed_tokens of each request.
+         valid_sampled_token_count = self._get_valid_sampled_token_count()
+@@ -1041,6 +1094,206 @@ class GPUModelRunner(
          # Refresh batch metadata with any pending updates.
          self.input_batch.refresh_metadata()
  
