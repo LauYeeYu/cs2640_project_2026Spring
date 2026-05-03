@@ -34,6 +34,12 @@ class StoredMemento:
     physical_block_ids are the SOURCE block ids on GPU at the moment of
     capture — useful for debug/verification, not for recall (those blocks
     will be freed shortly after).
+
+    gpu_pinned_block_ids (Phase 4a): when set, these GPU block IDs were
+    refcount-incremented at capture time so they survive the normal
+    free_blocks() call. The KV bytes are PRESERVED on GPU and can be
+    spliced back into a future request's block_table without H2D copy.
+    Released via `Scheduler.release_pinned_memento(memento_id)`.
     """
 
     memento_id: str
@@ -43,6 +49,7 @@ class StoredMemento:
     block_size: int
     num_layers: int
     cpu_kv: Optional[list[torch.Tensor]] = None  # populated by worker hook
+    gpu_pinned_block_ids: Optional[list[int]] = None  # populated by Phase 4a pin step
 
     def cpu_bytes(self) -> int:
         if self.cpu_kv is None:
@@ -116,3 +123,17 @@ class CaptureOp:
     src_block_ids: list[int]       # full-block captures (Phase 1: aligned only)
     block_size: int
     logical_range: tuple[int, int]
+
+
+@dataclass
+class KVRestoreOp:
+    """Manager→worker job: copy CPU pinned bytes for memento_id back to GPU.
+
+    Phase 3b — the inverse of CaptureOp. The caller (scheduler) has already
+    allocated `target_block_ids` from block_pool; the worker just copies
+    bytes into them via gpu_model_runner.restore_pinned_kv.
+    """
+
+    memento_id: str
+    request_id: str
+    target_block_ids: list[int]   # already-allocated GPU blocks to fill

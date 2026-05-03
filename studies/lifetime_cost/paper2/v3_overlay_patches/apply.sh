@@ -33,15 +33,16 @@ else
 fi
 
 if [[ ! -f "${TARGET_NEW_FILE}" ]]; then
-    echo "Installing memento_store.py ..."
+    echo "Installing memento_store.py (new) ..."
     cp "${NEW_FILE}" "${TARGET_NEW_FILE}"
+elif cmp -s "${NEW_FILE}" "${TARGET_NEW_FILE}"; then
+    echo "memento_store.py already in place (identical)."
 else
-    if cmp -s "${NEW_FILE}" "${TARGET_NEW_FILE}"; then
-        echo "memento_store.py already in place (identical)."
-    else
-        echo "memento_store.py exists but differs — leaving in place."
-        echo "  diff: diff ${NEW_FILE} ${TARGET_NEW_FILE}"
-    fi
+    # Overwrite — the .new file is the source of truth (it's regenerated
+    # from external/memento/.../memento_store.py whenever it changes).
+    # Without overwrite we'd silently use a stale version on rebuild.
+    echo "Updating memento_store.py (file differs from .new — overwriting)."
+    cp "${NEW_FILE}" "${TARGET_NEW_FILE}"
 fi
 
 echo ""

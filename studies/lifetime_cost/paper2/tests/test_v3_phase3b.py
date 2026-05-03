@@ -148,6 +148,81 @@ def test_queue_kv_restore_oom_returns_false():
     print("  OOM (memento bigger than free pool) → False ✓")
 
 
+def test_release_pinned_memento_decrements_refcount():
+    """Phase 4a: release_pinned_memento drops ref_cnt on the pinned blocks."""
+    from types import SimpleNamespace
+    api = _api()
+    api["reset"]()
+
+    # Mock blocks list with refcounts pre-incremented (as if pinned)
+    mock_blocks = [SimpleNamespace(block_id=i, ref_cnt=0) for i in range(20)]
+    pinned_ids = [5, 6, 7]
+    for bid in pinned_ids:
+        mock_blocks[bid].ref_cnt = 1   # simulate pin
+
+    class _FreeQueue:
+        def __init__(self):
+            self.appended = []
+        def append_n(self, blocks):
+            self.appended.extend(blocks)
+
+    pool = SimpleNamespace(
+        blocks=mock_blocks,
+        free_block_queue=_FreeQueue(),
+        get_num_free_blocks=lambda: 100,
+        get_new_blocks=lambda n: [],   # not used in this test
+    )
+
+    s = _MockScheduler()
+    s.kv_cache_manager.block_pool = pool
+
+    # Stash a pinned memento.
+    store = api["global_memento_store"]()
+    store.stash(api["StoredMemento"](
+        memento_id="m_pin",
+        request_id="orig",
+        logical_range=(0, 48),
+        physical_block_ids=pinned_ids,
+        block_size=16,
+        num_layers=0,
+        cpu_kv=None,
+        gpu_pinned_block_ids=list(pinned_ids),
+    ))
+
+    s.release_pinned_memento = api["Scheduler"].release_pinned_memento.__get__(s)
+    ok, msg = s.release_pinned_memento("m_pin")
+    assert ok is True, msg
+    assert "released 3 pinned blocks" in msg
+    # ref_cnt should be back to 0
+    for bid in pinned_ids:
+        assert mock_blocks[bid].ref_cnt == 0
+    # 3 blocks freed back to queue (since ref_cnt now 0)
+    assert len(pool.free_block_queue.appended) == 3
+    # Tag cleared
+    m = store.get("m_pin")
+    assert m.gpu_pinned_block_ids is None
+
+    # Calling again returns ok=False (already released).
+    ok2, msg2 = s.release_pinned_memento("m_pin")
+    assert ok2 is False
+    assert "not GPU-pinned" in msg2
+
+    api["reset"]()
+    print("  release pinned memento → refcount drops, blocks return to queue ✓")
+
+
+def test_release_pinned_memento_unknown_returns_false():
+    api = _api()
+    api["reset"]()
+    s = _MockScheduler()
+    s.release_pinned_memento = api["Scheduler"].release_pinned_memento.__get__(s)
+    ok, msg = s.release_pinned_memento("never_stashed")
+    assert ok is False
+    assert "unknown" in msg
+    api["reset"]()
+    print("  release unknown memento → False ✓")
+
+
 def test_two_restores_on_same_request_accumulate():
     api = _api()
     api["reset"]()
@@ -178,5 +253,7 @@ if __name__ == "__main__":
     test_queue_kv_restore_unknown_memento_returns_false()
     test_queue_kv_restore_allocates_and_queues()
     test_queue_kv_restore_oom_returns_false()
+    test_release_pinned_memento_decrements_refcount()
+    test_release_pinned_memento_unknown_returns_false()
     test_two_restores_on_same_request_accumulate()
-    print("ALL PHASE 3B API TESTS PASSED")
+    print("ALL PHASE 3B + 4A API TESTS PASSED")

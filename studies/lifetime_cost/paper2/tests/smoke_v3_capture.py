@@ -91,6 +91,14 @@ def main() -> int:
         print()
         print("PHASE 1 GPU SMOKE PASS: captures landed in scheduler-side MementoStore.")
         print("(Worker and scheduler share a process — single-process deploy.)")
+        # Phase 4a check — if any of the captured mementos has
+        # gpu_pinned_block_ids set, the pin step ran successfully.
+        pinned_count = sum(
+            1 for mid in store.memento_ids()
+            if (m := store.get(mid)) and m.gpu_pinned_block_ids
+        )
+        print(f"  Phase 4a: {pinned_count}/{len(store)} mementos have "
+              f"gpu_pinned_block_ids set")
         return 0
 
     print()
