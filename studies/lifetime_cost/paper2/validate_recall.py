@@ -1,0 +1,279 @@
+"""Recall validation across multiple strategies.
+
+Compares recall strategies side-by-side on the same set of SWE-bench Lite
+tasks, in one process so the vLLM engine cache is reused across runs.
+
+Strategies (PAPER2_RECALL_VARIANTS, comma-separated). Variant grammar:
+`<base>` or `<base>-<mode>`. Base picks WHAT to recall, mode picks HOW
+the recalled obs comes back into the prompt.
+
+Bases:
+  off            — no recall (control; reproduces vanilla memento behavior)
+  lru            — restore the most-recently-evicted memento (content-blind floor)
+  embedding      — restore the memento whose text is most similar to the
+                   trailing trajectory window (sentence-transformers MiniLM)
+
+Modes:
+  inplace (default) — clear `memento` on the original message; renderer
+                      drops in the full obs at the original chronological
+                      position. Tokens added in the middle shift the suffix
+                      → prefix cache misses past that point (cliff cost).
+  append            — leave the original message mementoed; push a synthetic
+                      user message at the END containing the recalled obs.
+                      Prefix preserved → cache hits everything before the
+                      addendum (cheap recall). The "stale historical truth"
+                      mechanism at the prompt layer.
+
+Examples:
+  PAPER2_RECALL_VARIANTS=off,lru,embedding              # v1 (inplace) baseline
+  PAPER2_RECALL_VARIANTS=off,lru,lru-append             # A/B inplace vs append
+  PAPER2_RECALL_VARIANTS=lru,lru-append,embedding,embedding-append   # full grid
+
+For each task we report read_file counts per file, recall fire counts,
+walltime, and whether the run resolved.
+
+    cd /home/vlad/adaptivecache-paper2
+    set -a && . /home/vlad/adaptivecache/.env && set +a
+    .venv-paper2/bin/python -m studies.lifetime_cost.paper2.validate_recall
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from collections import Counter
+from pathlib import Path
+from typing import Any, Dict, List
+
+_here = Path(__file__).resolve().parent
+_repo_root = _here.parents[2]
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
+
+os.environ.setdefault("VLLM_ATTENTION_BACKEND", "FLASHINFER")
+os.environ.setdefault("HF_HOME", "/scratch/hf/")
+os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
+
+from studies.lifetime_cost.pipeline.benchmarks.swebench_live import SWEBenchLive
+from studies.lifetime_cost.pipeline.runner import run_task
+from studies.lifetime_cost.paper2.adapters.memento_vllm import MementoVLLMModel
+from studies.lifetime_cost.paper2.policy.memento_policy import MementoPolicy
+
+
+MODEL = os.environ.get("PAPER2_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
+DEFAULT_INSTANCES = "psf__requests-3362,pytest-dev__pytest-7490,pytest-dev__pytest-5413,pylint-dev__pylint-5859"
+INSTANCE_IDS = [s.strip() for s in os.environ.get(
+    "PAPER2_INSTANCES",
+    os.environ.get("PAPER2_INSTANCE", DEFAULT_INSTANCES)
+).split(",") if s.strip()]
+MAX_STEPS = int(os.environ.get("PAPER2_MAX_STEPS", "20"))
+GPU_MEM_UTIL = float(os.environ.get("PAPER2_GPU_UTIL", "0.92"))
+MAX_MODEL_LEN = int(os.environ.get("PAPER2_MAX_LEN", "65000"))
+# T=0 makes seeds meaningless — multi-seed averaging requires real
+# stochasticity. Default T=0.6 matches the prior v0_swebench protocol.
+TEMPERATURE = float(os.environ.get("PAPER2_TEMPERATURE", "0.6"))
+N_SEEDS = int(os.environ.get("PAPER2_N_SEEDS", "1"))
+SEED_BASE = int(os.environ.get("PAPER2_SEED_BASE", "0"))
+RECALL_VARIANTS = [s.strip() for s in os.environ.get(
+    "PAPER2_RECALL_VARIANTS", "off,lru,embedding"
+).split(",") if s.strip()]
+EMBEDDING_THRESHOLD = float(os.environ.get("PAPER2_EMBEDDING_THRESHOLD", "0.40"))
+RECALL_LOW_WATER = float(os.environ.get("PAPER2_RECALL_LOW_WATER", "0.60"))
+RECALL_COOLDOWN = int(os.environ.get("PAPER2_RECALL_COOLDOWN", "3"))
+OUT_DIR = Path(os.environ.get(
+    "PAPER2_OUT_DIR",
+    "/home/vlad/adaptivecache-paper2/studies/lifetime_cost/paper2/out_v0_swebench",
+))
+
+
+def _build_policy(variant: str) -> MementoPolicy:
+    """Build a policy for a named variant.
+
+    Variant grammar: `<base>` or `<base>-<mode>`. Base is one of
+    `off|lru|embedding`. Mode is one of `inplace|append`; if omitted it
+    defaults to `inplace` (the v1 behavior). `off` ignores mode.
+    """
+    if "-" in variant:
+        base, mode = variant.split("-", 1)
+    else:
+        base, mode = variant, "inplace"
+    if mode not in ("inplace", "append"):
+        raise ValueError(f"unknown recall mode in variant {variant!r}: {mode!r}")
+
+    if base == "off":
+        return MementoPolicy(min_obs_chars=300, recall_enabled=False)
+    if base == "lru":
+        return MementoPolicy(
+            min_obs_chars=300,
+            recall_enabled=True,
+            recall_low_water_ratio=RECALL_LOW_WATER,
+            recall_cooldown_steps=RECALL_COOLDOWN,
+            recall_strategy="lru",
+            recall_mode=mode,
+        )
+    if base == "embedding":
+        return MementoPolicy(
+            min_obs_chars=300,
+            recall_enabled=True,
+            recall_low_water_ratio=RECALL_LOW_WATER,
+            recall_cooldown_steps=RECALL_COOLDOWN,
+            recall_strategy="embedding",
+            recall_strategy_kwargs={"threshold": EMBEDDING_THRESHOLD},
+            recall_mode=mode,
+        )
+    raise ValueError(f"unknown variant: {variant!r}")
+
+
+def _run(task, model, *, variant: str, seed: int = 0):
+    label = f"memento_{variant}"
+    print(f"\n--- {label} on {task.id} (T={TEMPERATURE}, seed={seed}) ---")
+    policy = _build_policy(variant)
+
+    # Override the model's default_seed for this run
+    model._default_seed = seed
+
+    t0 = time.perf_counter()
+    traj = run_task(
+        task, model, policy,
+        benchmark_name="swebench_live",
+        budget_tokens=24_000,
+        hard_budget_tokens=30_000,
+        max_completion_tokens=1024,
+    )
+    wall_total = int((time.perf_counter() - t0) * 1000)
+
+    suffix = f"_seed{seed}" if N_SEEDS > 1 else ""
+    out_path = OUT_DIR / f"{label}_{task.id.replace('/', '_')}{suffix}.json"
+    with open(out_path, "w") as f:
+        json.dump(traj.to_dict(), f, indent=2, default=str)
+
+    chat_wall = sum(s.wallclock_ms for s in traj.steps)
+    haiku_wall = sum(
+        (s.compaction_after.wallclock_ms if s.compaction_after else 0)
+        for s in traj.steps
+    )
+    n_recalls = sum(1 for s in traj.steps if s.recall_before is not None)
+
+    reads: Counter = Counter()
+    for s in traj.steps:
+        for tc in (s.response.tool_calls or []):
+            fn = tc.get("function", {}) or {}
+            if fn.get("name") == "read_file":
+                args = fn.get("arguments") or {}
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        args = {}
+                p = args.get("path", "?") if isinstance(args, dict) else "?"
+                reads[p] += 1
+
+    print(f"  steps={len(traj.steps)} resolved={traj.resolved} "
+          f"chat_wall={chat_wall}ms haiku_wall={haiku_wall}ms total={wall_total}ms "
+          f"compactions={traj.num_compactions} recalls={n_recalls} "
+          f"final_prompt={traj.steps[-1].usage.prompt_tokens if traj.steps else 0}")
+    print(f"  read_file calls: {sum(reads.values())} total")
+    for p, n in reads.most_common(5):
+        print(f"    {n:>3}× {p}")
+    return {
+        "task_id": task.id,
+        "variant": variant,
+        "seed": seed,
+        "label": label,
+        "steps": len(traj.steps),
+        "resolved": traj.resolved,
+        "chat_wall_ms": chat_wall,
+        "haiku_wall_ms": haiku_wall,
+        "total_wall_ms": wall_total,
+        "num_compactions": traj.num_compactions,
+        "num_recalls": n_recalls,
+        "reads": dict(reads),
+    }
+
+
+def main():
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    bench = SWEBenchLive(
+        instance_ids=INSTANCE_IDS,
+        cache_dir="/scratch/swebench_repos",
+        max_steps_per_task=MAX_STEPS,
+    )
+    tasks = list(bench.tasks())
+    if not tasks:
+        raise SystemExit(f"No tasks loaded from {INSTANCE_IDS!r}")
+
+    print(f"variants: {RECALL_VARIANTS}")
+    print(f"tasks: {[t.id for t in tasks]}")
+
+    model = MementoVLLMModel(
+        model_name=MODEL,
+        gpu_memory_utilization=GPU_MEM_UTIL,
+        max_model_len=MAX_MODEL_LEN,
+        masking_enabled=True,
+        debug_masking=False,
+        temperature=TEMPERATURE,
+    )
+
+    # Run order: seed outermost (so within a seed, all variants see the
+    # same RNG starting point); variant in the middle; tasks innermost.
+    rows: List[Dict[str, Any]] = []
+    for k in range(N_SEEDS):
+        seed = SEED_BASE + k
+        for variant in RECALL_VARIANTS:
+            for t in tasks:
+                rows.append(_run(t, model, variant=variant, seed=seed))
+
+    # Tabular summary
+    print("\n=== per-run summary ===")
+    print(f"  {'task':<32} {'variant':<10} {'seed':>4} {'steps':>5} {'res':>4} "
+          f"{'reads':>5} {'top_path':<28} {'top_n':>5} {'recs':>5} {'wall_s':>7}")
+    for r in rows:
+        top = max(r["reads"].items(), key=lambda kv: kv[1]) if r["reads"] else ("-", 0)
+        print(f"  {r['task_id'][:32]:<32} {r['variant']:<10} {r['seed']:>4} "
+              f"{r['steps']:>5} {str(r['resolved'])[:4]:>4} {sum(r['reads'].values()):>5} "
+              f"{top[0][:28]:<28} {top[1]:>5} {r['num_recalls']:>5} "
+              f"{r['total_wall_ms']/1000:>7.1f}")
+
+    # Aggregate across seeds: mean total_reads, top-path reads, resolve rate
+    import statistics
+    print("\n=== aggregate across seeds (mean ± std) ===")
+    print(f"  {'task':<32} {'variant':<10} {'reads':>14} {'top_path':<28} {'top_n':>14} "
+          f"{'resolve':>10} {'wall_s':>10}")
+    grouped: Dict[tuple, List[Dict[str, Any]]] = {}
+    for r in rows:
+        grouped.setdefault((r["task_id"], r["variant"]), []).append(r)
+    # find top_path per task across all variants/seeds (most consistently re-read file)
+    top_paths: Dict[str, str] = {}
+    for r in rows:
+        if not r["reads"]:
+            continue
+        cur_top = max(r["reads"].items(), key=lambda kv: kv[1])
+        prev = top_paths.get(r["task_id"])
+        if prev is None or cur_top[1] > sum(rr["reads"].get(prev, 0) for rr in grouped.get((r["task_id"], r["variant"]), [])):
+            # Prefer the path with the highest count in any single run.
+            top_paths[r["task_id"]] = cur_top[0]
+    for (task_id, variant), runs in grouped.items():
+        n = len(runs)
+        totals = [sum(rr["reads"].values()) for rr in runs]
+        tp = top_paths.get(task_id, "-")
+        tp_counts = [rr["reads"].get(tp, 0) for rr in runs]
+        resolves = [1 if rr["resolved"] else 0 for rr in runs]
+        walls = [rr["total_wall_ms"] / 1000 for rr in runs]
+        m_total = statistics.mean(totals)
+        s_total = statistics.stdev(totals) if n > 1 else 0
+        m_tp = statistics.mean(tp_counts)
+        s_tp = statistics.stdev(tp_counts) if n > 1 else 0
+        m_res = statistics.mean(resolves)
+        m_wall = statistics.mean(walls)
+        print(f"  {task_id[:32]:<32} {variant:<10} {m_total:>6.1f}±{s_total:>5.1f} "
+              f"{tp[:28]:<28} {m_tp:>6.1f}±{s_tp:>5.1f} "
+              f"{m_res:>10.2f} {m_wall:>10.1f}")
+
+    summary_path = OUT_DIR / "validate_recall_summary.json"
+    summary_path.write_text(json.dumps(rows, indent=2))
+    print(f"\nSaved: {summary_path}")
+
+
+if __name__ == "__main__":
+    main()

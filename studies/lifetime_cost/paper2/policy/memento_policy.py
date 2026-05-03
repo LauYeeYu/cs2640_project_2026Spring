@@ -32,6 +32,7 @@ from ...pipeline.types import CompactionEvent
 from ...pipeline.tokenization import count_messages
 
 from ..memento_writer import HaikuMementoWriter
+from .recall_strategy import RecallStrategy, build_recall_strategy
 
 
 def _tool_obs(msg: Dict[str, Any]) -> Optional[str]:
@@ -63,6 +64,13 @@ class MementoPolicy(CompactionPolicy):
         min_obs_chars: int = 500,
         trigger_ratio: float = 0.85,
         target_ratio: float = 0.55,
+        recall_enabled: bool = True,
+        recall_low_water_ratio: float = 0.60,
+        recall_cooldown_steps: int = 3,
+        recall_strategy: str = "lru",
+        recall_strategy_kwargs: Optional[Dict[str, Any]] = None,
+        recall_query_window: int = 4,
+        recall_mode: str = "inplace",
         writer: Optional[HaikuMementoWriter] = None,
         memento_model: str = "claude-haiku-4-5",
         max_obs_chars: int = 8000,
@@ -72,6 +80,16 @@ class MementoPolicy(CompactionPolicy):
         self._min_obs_chars = min_obs_chars
         self._trigger_ratio = trigger_ratio
         self._target_ratio = target_ratio
+        self._recall_enabled = recall_enabled
+        self._recall_low_water_ratio = recall_low_water_ratio
+        self._recall_cooldown_steps = recall_cooldown_steps
+        self._recall_strategy: RecallStrategy = build_recall_strategy(
+            recall_strategy, **(recall_strategy_kwargs or {})
+        )
+        self._recall_query_window = recall_query_window
+        if recall_mode not in ("inplace", "append"):
+            raise ValueError(f"recall_mode must be 'inplace' or 'append', got {recall_mode!r}")
+        self._recall_mode = recall_mode
         self._writer = writer or HaikuMementoWriter(
             model=memento_model, max_obs_chars=max_obs_chars
         )
@@ -79,6 +97,58 @@ class MementoPolicy(CompactionPolicy):
     def _estimate_tokens(self, messages: List[Dict[str, Any]], ctx: CompactionContext) -> int:
         """Use the runner-provided tokenizer for total context estimate."""
         return count_messages(messages, ctx.tokenizer)
+
+    def _recent_text_window(self, messages: List[Dict[str, Any]]) -> str:
+        """Concatenate the last K messages' text content as the recall query.
+
+        Captures the agent's most recent reasoning + tool args, which is the
+        best free signal for "what obs does the agent need now."
+        """
+        import json
+        K = max(1, self._recall_query_window)
+        chunks: List[str] = []
+        for m in messages[-K:]:
+            role = m.get("role", "")
+            content = m.get("content")
+            if isinstance(content, str) and content:
+                chunks.append(f"[{role}] {content}")
+            tcs = m.get("tool_calls")
+            if tcs:
+                chunks.append(json.dumps(tcs))
+        return "\n".join(chunks)
+
+    def _rendered_token_estimate(
+        self, messages: List[Dict[str, Any]], ctx: CompactionContext
+    ) -> int:
+        """Approximate the size of the prompt the engine actually sees.
+
+        A tool message with `memento` set renders as the short memento text
+        (`[tool_response, evicted, memento]\\n{memento}`) — the full obs is
+        never sent to the engine. count_messages counts the underlying
+        `content`, which overcounts by 5-10× once compaction has fired and
+        is therefore wrong for trigger logic that wants to track engine
+        load.
+        """
+        import json
+        total = 0
+        for m in messages:
+            total += 3
+            role = m.get("role")
+            if role == "tool" and m.get("memento"):
+                total += ctx.tokenizer.count(m.get("memento") or "")
+                continue
+            content = m.get("content") or ""
+            if isinstance(content, str):
+                total += ctx.tokenizer.count(content)
+            else:
+                total += ctx.tokenizer.count(json.dumps(content))
+            tcs = m.get("tool_calls")
+            if tcs:
+                total += ctx.tokenizer.count(json.dumps(tcs))
+            name = m.get("name")
+            if isinstance(name, str):
+                total += ctx.tokenizer.count(name)
+        return total
 
     def maybe_compact(
         self,
@@ -107,6 +177,14 @@ class MementoPolicy(CompactionPolicy):
             m = messages[i]
             if m.get("memento"):
                 continue
+            # Cooldown: don't immediately re-memento something that was just
+            # recalled. Without this, recall+compact thrash within a step pair.
+            recalled_at = m.get("recalled_step")
+            if (
+                recalled_at is not None
+                and ctx.step - int(recalled_at) < self._recall_cooldown_steps
+            ):
+                continue
             obs = m.get("content", "")
             if not isinstance(obs, str) or len(obs) < self._min_obs_chars:
                 continue
@@ -125,29 +203,40 @@ class MementoPolicy(CompactionPolicy):
         cost_total = 0.0
         bytes_tagged = 0
         projected_total = total_tok
+        n_fired = 0
 
         for i in candidates:
             if projected_total < target:
                 break
             msg = messages[i]
-            tool_name, tool_args = _trace_tool_call(messages, i)
-            text, usage = self._writer.write(
-                obs=msg["content"],
-                tool_name=tool_name,
-                tool_args=tool_args,
-            )
-            msg["memento"] = text
-            in_toks_total += usage.input_tokens
-            out_toks_total += usage.output_tokens
-            cost_total += usage.cost_usd
+            # Round-trip shortcut: if this msg was recalled (memento cleared
+            # but prior_memento stashed) and the cooldown is now satisfied,
+            # restore the stashed text instead of paying Haiku again.
+            stashed = msg.get("prior_memento")
+            if stashed:
+                text = stashed
+                msg["memento"] = text
+                msg["prior_memento"] = None
+            else:
+                tool_name, tool_args = _trace_tool_call(messages, i)
+                text, usage = self._writer.write(
+                    obs=msg["content"],
+                    tool_name=tool_name,
+                    tool_args=tool_args,
+                )
+                msg["memento"] = text
+                in_toks_total += usage.input_tokens
+                out_toks_total += usage.output_tokens
+                cost_total += usage.cost_usd
             bytes_tagged += len(msg["content"])
+            n_fired += 1
             # Project size reduction: obs goes from ~len/4 tokens to
             # roughly len(memento)/4 tokens once rendered as inline plain text.
             obs_tok = len(msg["content"]) // 4
             mem_tok = len(text) // 4
             projected_total -= max(0, obs_tok - mem_tok)
 
-        if in_toks_total == 0:
+        if n_fired == 0:
             # Nothing fired (target already met by the time we ran)
             return messages, None
 
@@ -166,6 +255,106 @@ class MementoPolicy(CompactionPolicy):
             wallclock_ms=wall_ms,
         )
         return messages, evt
+
+    def maybe_recall(
+        self,
+        messages: List[Dict[str, Any]],
+        ctx: CompactionContext,
+    ) -> Tuple[List[Dict[str, Any]], Optional[CompactionEvent]]:
+        """Restore an evicted obs back into the engine's view.
+
+        Two modes for HOW the obs comes back:
+
+        * `inplace` — clear the original tool message's `memento` field so the
+          renderer falls back to the full obs at its original chronological
+          position. This is what v1 shipped. Cost is high: adding tokens in
+          the middle of the prompt shifts every suffix position, killing the
+          prefix cache past that point (≈Paper-1 compaction-event cliff).
+
+        * `append` (default) — leave the original message mementoed; push a
+          synthetic user message at the END of the conversation containing
+          `[recalled, obs_id=N, originally_step=K]\\n<full obs>`. The
+          chronological prefix is unchanged; only an addendum appends to the
+          tail. Prefix cache hits everything before the addendum, so cost is
+          ≈ prefilling the obs (~$0.001 vs ~$0.10 cliff). The "stale
+          historical truth" framing — agent really did proceed memento-only;
+          recall extends the present with new context rather than rewriting
+          the past.
+
+        Trigger: total tokens below `recall_low_water_ratio * budget`. The
+        intuition is that if we have spare budget, bringing back one obs is
+        cheap and lets the model see the bytes instead of the placeholder.
+
+        Restores at most one obs per step (LRU floor; later policies will
+        do similarity-driven recall of multiple at once).
+        """
+        if not self._recall_enabled:
+            return messages, None
+
+        # Headroom check — only recall when the engine prompt has room to
+        # grow back. We use a memento-aware estimate so the trigger reflects
+        # what the engine actually sees, not the raw conversation size.
+        total_tok = self._rendered_token_estimate(messages, ctx)
+        low_water = int(self._recall_low_water_ratio * ctx.budget)
+        if total_tok >= low_water:
+            return messages, None
+
+        # Build a content-aware "query" for the strategy: the trailing
+        # assistant/tool/user content. LRU ignores it; embedding-similarity
+        # uses it to pick what the agent is currently focused on.
+        recent_text = self._recent_text_window(messages)
+        target_idx = self._recall_strategy.pick(
+            messages, step=ctx.step, recent_text=recent_text
+        )
+
+        if target_idx is None:
+            return messages, None
+
+        t0 = time.perf_counter()
+        msg = messages[target_idx]
+
+        if self._recall_mode == "inplace":
+            # v1 behavior: clear memento → renderer drops in full obs at the
+            # original position. Stash prior memento so the next compaction
+            # can restore it without re-paying Haiku.
+            msg["prior_memento"] = msg.get("memento")
+            msg["memento"] = None
+            msg["recalled_step"] = ctx.step
+            new_messages = messages
+        else:
+            # append mode: leave the original message mementoed; push the
+            # recalled obs as a synthetic user message at the tail. The
+            # original `messages` list is preserved (we return a NEW list so
+            # callers that retained the input don't see the addendum).
+            obs = msg.get("content") or ""
+            originally_step = msg.get("step_added")
+            tag = f"obs_id={target_idx}"
+            if originally_step is not None:
+                tag += f", originally_step={originally_step}"
+            addendum = {
+                "role": "user",
+                "content": f"[recalled, {tag}]\n{obs}",
+                "_recall_marker": True,
+                "_recall_target_idx": target_idx,
+            }
+            msg["recalled_step"] = ctx.step
+            new_messages = list(messages) + [addendum]
+
+        wall_ms = int((time.perf_counter() - t0) * 1000)
+        evt = CompactionEvent(
+            step=ctx.step,
+            policy=f"{self.name}.recall.{self._recall_mode}",
+            msgs_before=len(messages),
+            msgs_after=len(new_messages),
+            tokens_before=0,
+            tokens_after=0,
+            compaction_input_cached_tokens=0,
+            compaction_input_uncached_tokens=0,
+            compaction_output_tokens=0,
+            compaction_call_tokens=0,
+            wallclock_ms=wall_ms,
+        )
+        return new_messages, evt
 
 
 def _trace_tool_call(

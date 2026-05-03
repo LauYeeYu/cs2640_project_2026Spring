@@ -101,6 +101,18 @@ def run_task(
     step_idx = 0
 
     while not done and step_idx < task.max_steps:
+        # Recall hook fires BEFORE chat — gives the policy a chance to swap
+        # an inlined memento back to its full obs so the model sees the
+        # bytes it needs this turn.
+        recall_ctx = CompactionContext(
+            step=step_idx,
+            budget=budget_tokens,
+            hard_budget=hard_budget_tokens,
+            tokenizer=tokenizer,
+            summarizer=summarizer,
+        )
+        messages, recall_event = policy.maybe_recall(messages, recall_ctx)
+
         t0 = time.perf_counter()
         resp = model.chat(
             messages,
@@ -157,6 +169,7 @@ def run_task(
             usage=resp.usage or Usage(0, 0, 0),
             wallclock_ms=wall_ms,
             compaction_after=comp_event,
+            recall_before=recall_event,
         ))
         step_idx += 1
 
@@ -184,4 +197,8 @@ def _message_kwargs(m: dict) -> dict:
         out["tool_calls"] = m["tool_calls"]
     if "tool_call_id" in m:
         out["tool_call_id"] = m["tool_call_id"]
+    if "memento" in m:
+        out["memento"] = m["memento"]
+    if "recalled_step" in m:
+        out["recalled_step"] = m["recalled_step"]
     return out

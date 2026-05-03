@@ -44,6 +44,9 @@ GPU_MEM_UTIL = float(os.environ.get("PAPER2_GPU_UTIL", "0.92"))
 MAX_MODEL_LEN = int(os.environ.get("PAPER2_MAX_LEN", "65000"))
 N_SEEDS = int(os.environ.get("PAPER2_N_SEEDS", "1"))
 TEMPERATURE = float(os.environ.get("PAPER2_TEMPERATURE", "0.0"))
+RECALL_ENABLED = os.environ.get("PAPER2_RECALL", "1") not in ("0", "false", "False")
+RECALL_LOW_WATER = float(os.environ.get("PAPER2_RECALL_LOW_WATER", "0.60"))
+RECALL_COOLDOWN = int(os.environ.get("PAPER2_RECALL_COOLDOWN", "3"))
 OUT_DIR = Path(os.environ.get("PAPER2_OUT_DIR", "/home/vlad/adaptivecache-paper2/studies/lifetime_cost/paper2/out_v0_swebench"))
 
 
@@ -71,7 +74,15 @@ def _run_one_task(task, *, masking: bool, label: str, seed: int = 0, temperature
         debug_masking=False,
         temperature=temperature,
     )
-    policy = MementoPolicy(min_obs_chars=MIN_OBS_CHARS) if masking else NoCompaction()
+    if masking:
+        policy = MementoPolicy(
+            min_obs_chars=MIN_OBS_CHARS,
+            recall_enabled=RECALL_ENABLED,
+            recall_low_water_ratio=RECALL_LOW_WATER,
+            recall_cooldown_steps=RECALL_COOLDOWN,
+        )
+    else:
+        policy = NoCompaction()
     t0 = time.perf_counter()
     traj = run_task(
         task, model, policy,
@@ -89,7 +100,29 @@ def _run_one_task(task, *, masking: bool, label: str, seed: int = 0, temperature
 
     chat_wall = sum(s.wallclock_ms for s in traj.steps)
     haiku_wall = sum((s.compaction_after.wallclock_ms if s.compaction_after else 0) for s in traj.steps)
-    print(f"  steps={len(traj.steps)} resolved={traj.resolved} chat_wall={chat_wall}ms haiku_wall={haiku_wall}ms total={wall_total_ms}ms compactions={traj.num_compactions} final_prompt={traj.steps[-1].usage.prompt_tokens if traj.steps else 0}")
+    n_recalls = sum(1 for s in traj.steps if s.recall_before is not None)
+
+    # Read-call distribution: which files did the agent re-read, how often?
+    from collections import Counter
+    read_paths: Counter = Counter()
+    for s in traj.steps:
+        for tc in (s.response.tool_calls or []):
+            fn = tc.get("function", {}) or {}
+            if fn.get("name") == "read_file":
+                args = fn.get("arguments") or {}
+                if isinstance(args, str):
+                    try:
+                        import json as _j
+                        args = _j.loads(args)
+                    except Exception:
+                        args = {}
+                p = args.get("path", "?") if isinstance(args, dict) else "?"
+                read_paths[p] += 1
+    top_reads = read_paths.most_common(3)
+
+    print(f"  steps={len(traj.steps)} resolved={traj.resolved} chat_wall={chat_wall}ms haiku_wall={haiku_wall}ms total={wall_total_ms}ms compactions={traj.num_compactions} recalls={n_recalls} final_prompt={traj.steps[-1].usage.prompt_tokens if traj.steps else 0}")
+    if top_reads:
+        print(f"  top reads: {', '.join(f'{n}× {p}' for p, n in top_reads)}")
     return {
         "task_id": task.id,
         "label": label,
@@ -101,8 +134,10 @@ def _run_one_task(task, *, masking: bool, label: str, seed: int = 0, temperature
         "haiku_wall_ms": haiku_wall,
         "total_wall_ms": wall_total_ms,
         "num_compactions": traj.num_compactions,
+        "num_recalls": n_recalls,
         "final_prompt_tokens": traj.steps[-1].usage.prompt_tokens if traj.steps else 0,
         "final_answer_truncated": (traj.final_answer or "")[:120],
+        "read_paths": dict(read_paths),
     }
 
 

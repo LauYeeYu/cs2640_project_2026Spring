@@ -56,6 +56,23 @@ class CompactionPolicy(abc.ABC):
         """Returns (possibly-modified messages, event if compaction fired)."""
         ...
 
+    def maybe_recall(
+        self,
+        messages: List[dict],
+        ctx: CompactionContext,
+    ) -> Tuple[List[dict], Optional[CompactionEvent]]:
+        """Bidirectional companion to maybe_compact.
+
+        Called by the runner BEFORE each model.chat() call. Lets the policy
+        restore previously-evicted content (e.g. swap an inlined memento
+        back to its full obs) when the prompt has headroom and the agent is
+        likely to need the bytes back.
+
+        Default: noop. Policies that support recall (currently only
+        MementoPolicy) override.
+        """
+        return messages, None
+
     # convenience
     @staticmethod
     def _token_count(messages: List[dict], tokenizer: Tokenizer) -> int:

@@ -31,6 +31,8 @@ class Message:
     name: Optional[str] = None
     tool_calls: Optional[List[Dict[str, Any]]] = None
     tool_call_id: Optional[str] = None
+    memento: Optional[str] = None
+    recalled_step: Optional[int] = None
     _msg_id: Optional[str] = None
     _token_count: Optional[int] = None
 
@@ -42,6 +44,10 @@ class Message:
             d["tool_calls"] = self.tool_calls
         if self.tool_call_id is not None:
             d["tool_call_id"] = self.tool_call_id
+        if self.memento is not None:
+            d["memento"] = self.memento
+        if self.recalled_step is not None:
+            d["recalled_step"] = self.recalled_step
         if self._msg_id is not None:
             d["_msg_id"] = self._msg_id
         if self._token_count is not None:
@@ -95,6 +101,7 @@ class Step:
     usage: Usage
     wallclock_ms: int = 0
     compaction_after: Optional[CompactionEvent] = None  # if compaction fired right after
+    recall_before: Optional[CompactionEvent] = None     # if recall fired before this step's chat
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -104,6 +111,7 @@ class Step:
             "usage": asdict(self.usage),
             "wallclock_ms": self.wallclock_ms,
             "compaction_after": asdict(self.compaction_after) if self.compaction_after else None,
+            "recall_before": asdict(self.recall_before) if self.recall_before else None,
         }
 
 
