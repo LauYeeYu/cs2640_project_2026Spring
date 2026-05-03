@@ -4,28 +4,52 @@ The image pins:
   - CUDA 12.8 (matches the Memento overlay's expected runtime)
   - vLLM 0.13.0 (the Memento overlay's base version)
   - microsoft/memento at d8c10e6 (the commit our v3 patches are authored against)
-  - cainamisir/adaptivecache @ paper2-memento-recall (where our patches live)
+
+The repo source is baked into the image at build time via add_local_dir so the
+build can apply our overlay patches. (We don't clone from GitHub because the
+adaptivecache repo is private — Modal containers have no GitHub auth.)
 
 Build steps (executed once at image-build time, then cached):
   1. apt deps + python deps
-  2. clone our adaptivecache repo at the paper2 branch
-  3. clone microsoft/memento at the patch's base commit
+  2. add local studies/ tree → /opt/adaptivecache/studies/  (copy=True)
+  3. clone microsoft/memento (public) at the patch's base commit
   4. apply v3_overlay_patches/ (turns the vanilla overlay into our Phase 1 fork)
   5. run install_overlay.sh (rsyncs Python files into vLLM's site-packages)
 
 After build, the container has:
-  - /opt/adaptivecache  — paper2 source tree (paper2-memento-recall branch)
+  - /opt/adaptivecache  — paper2 source tree
   - /opt/adaptivecache/external/memento — overlay clone with v3 patches applied
   - vLLM in site-packages with our overlay rsynced over it
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import modal
 
 
-REPO_URL = "https://github.com/cainamisir/adaptivecache.git"
-REPO_BRANCH = "paper2-memento-recall"
 MEMENTO_COMMIT = "d8c10e6"
+
+# Local source root — this script is paper2/modal_app/image.py.
+# Paper2 source root is .../studies/lifetime_cost/paper2/
+# Repo root for our purposes is .../studies/  (we ship the whole studies tree
+# so pipeline/ + paper2/ + benchmarks/ are all available inside the container).
+_HERE = Path(__file__).resolve().parent
+_PAPER2_DIR = _HERE.parent
+_STUDIES_DIR = _PAPER2_DIR.parent.parent  # .../studies/
+
+# Files we don't want baked into the image (size + relevance).
+_IGNORE = [
+    "**/__pycache__/**",
+    "**/*.pyc",
+    "**/*.pyo",
+    "**/.pytest_cache/**",
+    # Trajectory outputs are large and regenerable — never bake.
+    "lifetime_cost/paper2/out_v0_swebench/**",
+    # Local-only data dirs unrelated to paper2.
+    "lifetime_cost/out/**",
+    "lifetime_cost/external_traces/**",
+]
 
 # The image builds on a CUDA 12.8 base so the overlay's FlashInfer requirement
 # (per HANDOFF.md note 1) works on Hopper/Ampere as well as Blackwell. Modal's
@@ -48,10 +72,17 @@ image = (
         "datasets",
         "uv",
     )
+    # Copy the local source tree into the image at build time so subsequent
+    # build steps (overlay patch + install) can read it. copy=True is required
+    # because run_commands runs after this and needs the files present.
+    .add_local_dir(
+        str(_STUDIES_DIR),
+        remote_path="/opt/adaptivecache/studies",
+        copy=True,
+        ignore=_IGNORE,
+    )
     .run_commands(
-        # Clone the project repo (paper2 branch — has overlay patches + sources)
-        f"cd /opt && git clone --depth 1 -b {REPO_BRANCH} {REPO_URL} adaptivecache",
-        # Clone microsoft/memento at the commit our patches are authored against
+        # Clone microsoft/memento (PUBLIC) at the commit our patches target
         f"cd /opt/adaptivecache && mkdir -p external && "
         f"git clone https://github.com/microsoft/memento.git external/memento && "
         f"cd external/memento && git checkout {MEMENTO_COMMIT}",

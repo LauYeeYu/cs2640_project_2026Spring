@@ -389,7 +389,7 @@ index de7ce2e..f23a44f 100644
      def _get_kv_copy_ops(
          self,
 diff --git a/vllm/vllm/v1/worker/gpu_model_runner.py b/vllm/vllm/v1/worker/gpu_model_runner.py
-index f677b37..06dfd18 100644
+index f677b37..b8bb9b6 100644
 --- a/vllm/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/vllm/v1/worker/gpu_model_runner.py
 @@ -866,6 +866,13 @@ class GPUModelRunner(
@@ -406,7 +406,7 @@ index f677b37..06dfd18 100644
          # Execute KV cache copy operations for compaction BEFORE updating block tables.
          # These physically move KV values to compact the cache after span removal.
          if scheduler_output.kv_copy_operations:
-@@ -1041,6 +1048,82 @@ class GPUModelRunner(
+@@ -1041,6 +1048,94 @@ class GPUModelRunner(
          # Refresh batch metadata with any pending updates.
          self.input_batch.refresh_metadata()
  
@@ -447,6 +447,15 @@ index f677b37..06dfd18 100644
 +        first_cache = self.kv_caches[0]
 +        flash_attn_layout = (first_cache.shape[0] == 2)
 +
++        # Phase 1 diagnostic — worker stdout is captured in Modal logs so we
++        # can confirm the capture branch reached the worker process even when
++        # MementoStore.global_memento_store() in a DIFFERENT process is empty.
++        n_ops_total = sum(len(ops) for ops in kv_capture_operations.values())
++        print(f"[v3-capture] _execute_kv_capture_operations: "
++              f"{len(kv_capture_operations)} requests, {n_ops_total} ops, "
++              f"layers={num_layers}, layout={'FA' if flash_attn_layout else 'FlashInfer'}",
++              flush=True)
++
 +        for req_id, ops in kv_capture_operations.items():
 +            for op in ops:
 +                src_block_ids = list(op.src_block_ids)
@@ -485,6 +494,9 @@ index f677b37..06dfd18 100644
 +                    cpu_kv=cpu_kv,
 +                )
 +                store.stash(memento)
++                print(f"[v3-capture]   stashed {op.memento_id}  "
++                      f"blocks={len(src_block_ids)}  bytes={memento.cpu_bytes()}  "
++                      f"store_total={store.total_cpu_bytes()}", flush=True)
 +
      def _execute_kv_copy_operations(
          self,
