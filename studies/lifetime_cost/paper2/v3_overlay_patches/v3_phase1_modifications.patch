@@ -19,10 +19,10 @@ index fda9f45..103fd38 100644
      _block_start_id: Optional[int] = field(default=None, repr=False)
      _block_end_id: Optional[int] = field(default=None, repr=False)
 diff --git a/vllm/vllm/v1/core/block_masking/__init__.py b/vllm/vllm/v1/core/block_masking/__init__.py
-index 37c8bbd..9afdad8 100644
+index 37c8bbd..0db2f3e 100644
 --- a/vllm/vllm/v1/core/block_masking/__init__.py
 +++ b/vllm/vllm/v1/core/block_masking/__init__.py
-@@ -9,9 +9,23 @@ using vLLM's token span removal infrastructure.
+@@ -9,9 +9,25 @@ using vLLM's token span removal infrastructure.
  
  from .tracker import BlockMaskingState, BlockInfo
  from .processor import BlockMaskingProcessor
@@ -31,6 +31,7 @@ index 37c8bbd..9afdad8 100644
 +    MementoStore,
 +    CaptureSpec,
 +    CaptureOp,
++    KVRestoreOp,
 +    global_memento_store,
 +    reset_global_memento_store,
 +)
@@ -43,6 +44,7 @@ index 37c8bbd..9afdad8 100644
 +    "MementoStore",
 +    "CaptureSpec",
 +    "CaptureOp",
++    "KVRestoreOp",
 +    "global_memento_store",
 +    "reset_global_memento_store",
  ]
@@ -138,10 +140,10 @@ index 3297434..387a952 100644
 +            request_id, active_physical_positions, capture_specs=capture_specs,
          )
 diff --git a/vllm/vllm/v1/core/sched/output.py b/vllm/vllm/v1/core/sched/output.py
-index db7a4d2..6d90dc8 100644
+index db7a4d2..80e5e79 100644
 --- a/vllm/vllm/v1/core/sched/output.py
 +++ b/vllm/vllm/v1/core/sched/output.py
-@@ -217,6 +217,13 @@ class SchedulerOutput:
+@@ -217,6 +217,21 @@ class SchedulerOutput:
      # to physically move KV values during context compression.
      kv_copy_operations: dict[str, list[tuple[int, int, int, int]]] | None = None
  
@@ -152,14 +154,22 @@ index db7a4d2..6d90dc8 100644
 +    # requested via Scheduler.mask_token_span(capture_for_memento_id=...).
 +    kv_capture_operations: dict[str, list] | None = None
 +
++    # req_id -> list of KVRestoreOp (block_masking.memento_store).
++    # Paper 2 v3 Phase 3b: the inverse of capture. The worker copies CPU
++    # pinned bytes for each memento_id back to the named GPU block IDs
++    # (which the scheduler already allocated via block_pool). Runs BEFORE
++    # the model forward, so spliced KV is in place when attention reads it.
++    # None unless populated via Scheduler.queue_kv_restore(...).
++    kv_restore_operations: dict[str, list] | None = None
++
      # req_id -> tuple of num_blocks per KV cache group
      # for block table truncation after compaction.
      block_table_truncations: dict[str, tuple[int, ...]] | None = None
 diff --git a/vllm/vllm/v1/core/sched/scheduler.py b/vllm/vllm/v1/core/sched/scheduler.py
-index 6b0d8fe..6fa51fc 100644
+index 6b0d8fe..2980cb5 100644
 --- a/vllm/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/vllm/v1/core/sched/scheduler.py
-@@ -185,6 +185,14 @@ class Scheduler(SchedulerInterface):
+@@ -185,6 +185,19 @@ class Scheduler(SchedulerInterface):
              str, list[tuple[int, int, int, int]]
          ] = {}
  
@@ -171,10 +181,15 @@ index 6b0d8fe..6fa51fc 100644
 +        # capture_for_memento_id to mask_token_span.
 +        self.pending_kv_capture_operations: dict[str, list] = {}
 +
++        # Pending KV RESTORE operations for Paper 2 v3 Phase 3b. The worker
++        # copies CPU pinned bytes back into the named (already-allocated)
++        # GPU blocks. Populated by `Scheduler.queue_kv_restore(...)`.
++        self.pending_kv_restore_operations: dict[str, list] = {}
++
          # Block table truncation info after KV cache compaction.
          # Maps request_id -> tuple of num_blocks per KV cache group.
          self.pending_block_table_truncations: dict[str, tuple[int, ...]] = {}
-@@ -773,6 +781,14 @@ class Scheduler(SchedulerInterface):
+@@ -773,6 +786,22 @@ class Scheduler(SchedulerInterface):
          )
          self.pending_block_table_truncations.clear()
  
@@ -186,18 +201,27 @@ index 6b0d8fe..6fa51fc 100644
 +        )
 +        self.pending_kv_capture_operations.clear()
 +
++        # Get pending KV restore operations (Phase 3b).
++        kv_restore_operations = (
++            self.pending_kv_restore_operations.copy()
++            if self.pending_kv_restore_operations
++            else None
++        )
++        self.pending_kv_restore_operations.clear()
++
          # Block masking: Detect requests with pending compactions that are
          # about to transition from prefill to decode. These should skip
          # sampling so compaction can run before the first decode token.
-@@ -816,6 +832,7 @@ class Scheduler(SchedulerInterface):
+@@ -816,6 +845,8 @@ class Scheduler(SchedulerInterface):
              finished_req_ids=self.finished_req_ids,
              free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
              kv_copy_operations=kv_copy_operations,
 +            kv_capture_operations=kv_capture_operations,
++            kv_restore_operations=kv_restore_operations,
              block_table_truncations=block_table_truncations,
              skip_sampling_req_ids=skip_sampling_req_ids,
          )
-@@ -1259,6 +1276,8 @@ class Scheduler(SchedulerInterface):
+@@ -1259,6 +1290,8 @@ class Scheduler(SchedulerInterface):
                              request.request_id,
                              start,
                              end,
@@ -206,7 +230,7 @@ index 6b0d8fe..6fa51fc 100644
                          )
                          if (self.block_masking_config is not None and
                              self.block_masking_config.debug):
-@@ -1469,6 +1488,8 @@ class Scheduler(SchedulerInterface):
+@@ -1469,6 +1502,8 @@ class Scheduler(SchedulerInterface):
                          request.request_id,
                          start,
                          end,
@@ -215,7 +239,7 @@ index 6b0d8fe..6fa51fc 100644
                      )
                      if (self.block_masking_config is not None and
                          self.block_masking_config.debug):
-@@ -1510,6 +1531,8 @@ class Scheduler(SchedulerInterface):
+@@ -1510,6 +1545,8 @@ class Scheduler(SchedulerInterface):
                          request.request_id,
                          start,
                          end,
@@ -224,10 +248,61 @@ index 6b0d8fe..6fa51fc 100644
                      )
                      if (self.block_masking_config is not None and
                          self.block_masking_config.debug):
-@@ -1759,11 +1782,27 @@ class Scheduler(SchedulerInterface):
+@@ -1759,11 +1796,78 @@ class Scheduler(SchedulerInterface):
                  merged.append((start, end))
          return merged
  
++    def queue_kv_restore(
++        self,
++        request_id: str,
++        memento_id: str,
++    ) -> "tuple[bool, str]":
++        """Allocate fresh GPU blocks + queue a KVRestoreOp for the worker.
++
++        Paper 2 v3 Phase 3b. Resolves the memento_id via the scheduler-side
++        MementoStore (populated metadata-only at capture time), allocates as
++        many blocks as the captured memento occupies via block_pool, and
++        appends a KVRestoreOp to `pending_kv_restore_operations[request_id]`.
++        The worker will receive these in the next SchedulerOutput and call
++        `gpu_model_runner.restore_pinned_kv` to fill the GPU bytes BEFORE
++        running the model forward.
++
++        This is the data-path piece. Phase 3c will splice the allocated
++        block IDs into the request's block_table at the original chronological
++        positions so attention reads them as part of normal forward.
++
++        Returns:
++            (ok, message). ok=True on success, False if memento unknown or
++            block allocation failed.
++        """
++        from vllm.v1.core.block_masking.memento_store import (
++            global_memento_store as _gms,
++            KVRestoreOp,
++        )
++        sched_store = _gms()
++        m = sched_store.get(memento_id)
++        if m is None:
++            return False, f"unknown memento_id={memento_id!r}"
++
++        n_blocks = len(m.physical_block_ids)
++        if n_blocks == 0:
++            return False, f"memento {memento_id!r} has no blocks"
++
++        try:
++            blocks = self.kv_cache_manager.block_pool.get_new_blocks(n_blocks)
++        except ValueError as e:
++            return False, f"block allocation failed: {e}"
++
++        target_block_ids = [b.block_id for b in blocks]
++        op = KVRestoreOp(
++            memento_id=memento_id,
++            request_id=request_id,
++            target_block_ids=target_block_ids,
++        )
++        self.pending_kv_restore_operations.setdefault(request_id, []).append(op)
++        return True, (f"queued restore: {n_blocks} blocks → "
++                      f"target_block_ids={target_block_ids}")
++
 +    def _auto_memento_id(
 +        self, request_id: str, start_position: int, end_position: int
 +    ) -> "str | None":
@@ -252,7 +327,7 @@ index 6b0d8fe..6fa51fc 100644
      ) -> SpanRemovalResult:
          """Mask a span of tokens and compact the KV cache in one step.
  
-@@ -1776,6 +1815,11 @@ class Scheduler(SchedulerInterface):
+@@ -1776,6 +1880,11 @@ class Scheduler(SchedulerInterface):
              request_id: The request ID.
              start_position: Start logical position (inclusive).
              end_position: End logical position (exclusive).
@@ -264,7 +339,7 @@ index 6b0d8fe..6fa51fc 100644
  
          Returns:
              SpanRemovalResult with success status, tokens removed, and
-@@ -1854,16 +1898,38 @@ class Scheduler(SchedulerInterface):
+@@ -1854,16 +1963,55 @@ class Scheduler(SchedulerInterface):
              request.logical_to_physical(p) for p in active_logical
          ]
  
@@ -295,11 +370,28 @@ index 6b0d8fe..6fa51fc 100644
          if copy_ops:
              self.pending_kv_copy_operations[request_id] = copy_ops
  
-+        # Store capture operations to be sent to worker (Phase 1A — worker
-+        # hook is wired in Phase 1B; until then capture_ops is recorded
-+        # but not yet executed).
++        # Store capture operations to be sent to worker.
 +        if capture_ops:
 +            self.pending_kv_capture_operations[request_id] = capture_ops
++            # Phase 3b: also stash a metadata-only StoredMemento on the
++            # SCHEDULER-side memento store so a future Scheduler.queue_kv_restore
++            # can look up block_count + block_size without a worker round-trip.
++            # The worker maintains its own MementoStore (with the actual cpu_kv
++            # bytes); the scheduler-side store has metadata only (cpu_kv=None).
++            from vllm.v1.core.block_masking.memento_store import (
++                StoredMemento, global_memento_store as _gms,
++            )
++            sched_store = _gms()
++            for op in capture_ops:
++                sched_store.stash(StoredMemento(
++                    memento_id=op.memento_id,
++                    request_id=op.request_id,
++                    logical_range=op.logical_range,
++                    physical_block_ids=list(op.src_block_ids),
++                    block_size=op.block_size,
++                    num_layers=0,  # not knowable scheduler-side; informational only
++                    cpu_kv=None,
++                ))
 +
          # Store block table truncation info for the worker.
          num_active = len(active_physical)
@@ -389,10 +481,10 @@ index de7ce2e..f23a44f 100644
      def _get_kv_copy_ops(
          self,
 diff --git a/vllm/vllm/v1/worker/gpu_model_runner.py b/vllm/vllm/v1/worker/gpu_model_runner.py
-index f677b37..06d249c 100644
+index f677b37..aa57eb8 100644
 --- a/vllm/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/vllm/v1/worker/gpu_model_runner.py
-@@ -866,6 +866,13 @@ class GPUModelRunner(
+@@ -866,6 +866,22 @@ class GPUModelRunner(
          is_last_rank = get_pp_group().is_last_rank
          req_data = scheduler_output.scheduled_cached_reqs
  
@@ -403,10 +495,19 @@ index f677b37..06d249c 100644
 +        if scheduler_output.kv_capture_operations:
 +            self._execute_kv_capture_operations(scheduler_output.kv_capture_operations)
 +
++        # Paper 2 v3 Phase 3b: restore CPU pinned bytes back to GPU at
++        # specific (already-allocated) block IDs. This runs AFTER capture
++        # (so we don't overwrite freshly-captured bytes), BEFORE copy ops
++        # (so the spliced KV is in its target slots before compaction
++        # runs anywhere else), and BEFORE the model forward (so attention
++        # can read from the restored slots).
++        if getattr(scheduler_output, "kv_restore_operations", None):
++            self._execute_kv_restore_operations(scheduler_output.kv_restore_operations)
++
          # Execute KV cache copy operations for compaction BEFORE updating block tables.
          # These physically move KV values to compact the cache after span removal.
          if scheduler_output.kv_copy_operations:
-@@ -1041,6 +1048,174 @@ class GPUModelRunner(
+@@ -1041,6 +1057,206 @@ class GPUModelRunner(
          # Refresh batch metadata with any pending updates.
          self.input_batch.refresh_metadata()
  
@@ -497,6 +598,38 @@ index f677b37..06d249c 100644
 +                print(f"[v3-capture]   stashed {op.memento_id}  "
 +                      f"blocks={len(src_block_ids)}  bytes={memento.cpu_bytes()}  "
 +                      f"store_total={store.total_cpu_bytes()}", flush=True)
++
++    def _execute_kv_restore_operations(
++        self,
++        kv_restore_operations: dict,
++    ) -> None:
++        """Apply each KVRestoreOp by calling restore_pinned_kv per op.
++
++        Phase 3b worker hook. The scheduler queued these via
++        `Scheduler.queue_kv_restore`, which already allocated fresh GPU
++        blocks. Our job: copy the corresponding CPU pinned bytes (stashed
++        at capture time) into those blocks, then return — by the time the
++        model forward runs, the spliced KV is in place.
++
++        Failures are logged + skipped (not raised) — a missing memento_id
++        just means the recall was a no-op for that op; the request's
++        block_table still has the freshly-allocated empty blocks, which
++        the model would normally prefill (degrading to v1 behavior).
++        """
++        if not self.kv_caches or not kv_restore_operations:
++            return
++
++        n_ops_total = sum(len(ops) for ops in kv_restore_operations.values())
++        print(f"[v3-restore] _execute_kv_restore_operations: "
++              f"{len(kv_restore_operations)} requests, {n_ops_total} ops",
++              flush=True)
++
++        for req_id, ops in kv_restore_operations.items():
++            for op in ops:
++                ok = self.restore_pinned_kv(op.memento_id, list(op.target_block_ids))
++                if not ok:
++                    print(f"[v3-restore]   restore FAILED for memento_id="
++                          f"{op.memento_id!r} req_id={req_id!r}", flush=True)
 +
 +    def restore_pinned_kv(
 +        self,
