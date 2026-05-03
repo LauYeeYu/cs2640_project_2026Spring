@@ -389,7 +389,7 @@ index de7ce2e..f23a44f 100644
      def _get_kv_copy_ops(
          self,
 diff --git a/vllm/vllm/v1/worker/gpu_model_runner.py b/vllm/vllm/v1/worker/gpu_model_runner.py
-index f677b37..b8bb9b6 100644
+index f677b37..06d249c 100644
 --- a/vllm/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/vllm/v1/worker/gpu_model_runner.py
 @@ -866,6 +866,13 @@ class GPUModelRunner(
@@ -406,7 +406,7 @@ index f677b37..b8bb9b6 100644
          # Execute KV cache copy operations for compaction BEFORE updating block tables.
          # These physically move KV values to compact the cache after span removal.
          if scheduler_output.kv_copy_operations:
-@@ -1041,6 +1048,94 @@ class GPUModelRunner(
+@@ -1041,6 +1048,174 @@ class GPUModelRunner(
          # Refresh batch metadata with any pending updates.
          self.input_batch.refresh_metadata()
  
@@ -497,6 +497,86 @@ index f677b37..b8bb9b6 100644
 +                print(f"[v3-capture]   stashed {op.memento_id}  "
 +                      f"blocks={len(src_block_ids)}  bytes={memento.cpu_bytes()}  "
 +                      f"store_total={store.total_cpu_bytes()}", flush=True)
++
++    def restore_pinned_kv(
++        self,
++        memento_id: str,
++        target_gpu_block_ids: "list[int]",
++    ) -> bool:
++        """Inverse of _execute_kv_capture_operations: CPU pinned → GPU.
++
++        Paper 2 v3 Phase 3a — given a memento_id whose KV bytes are currently
++        in this worker's MementoStore, copy those bytes back to GPU into the
++        provided target block_ids. Caller is responsible for allocating the
++        target blocks (via block_pool) and wiring them into a request's
++        block_table at the desired logical positions.
++
++        Layout (must match capture path):
++        - FlashAttention: kv_cache shape [2, num_blocks, block_size, num_kv_heads, head_size]
++        - FlashInfer:     kv_cache shape [num_blocks, 2, block_size, num_kv_heads, head_size]
++
++        Returns True on success, False if memento_id is unknown, the count
++        mismatches, or the layout is wrong. The copy itself is unconditional
++        once arguments are validated — bytes overwrite whatever's in the
++        target slots.
++
++        Args:
++            memento_id: A previously-stashed memento. Looked up in
++                global_memento_store(). The CPU tensors were captured during
++                a `_execute_kv_capture_operations` call.
++            target_gpu_block_ids: Fresh GPU block IDs of the same length as
++                the captured src_block_ids. The caller acquired these from
++                block_pool — Phase 3b wires the allocation + block_table
++                splice; this function does only the copy.
++        """
++        if not self.kv_caches:
++            return False
++
++        import torch as _torch
++        from vllm.v1.core.block_masking.memento_store import (
++            global_memento_store,
++        )
++
++        store = global_memento_store()
++        m = store.get(memento_id)
++        if m is None or m.cpu_kv is None:
++            print(f"[v3-restore] missing memento_id={memento_id!r}; store has "
++                  f"{store.memento_ids()}", flush=True)
++            return False
++
++        n_blocks = len(target_gpu_block_ids)
++        if n_blocks != len(m.physical_block_ids):
++            print(f"[v3-restore] block count mismatch: target={n_blocks} "
++                  f"captured={len(m.physical_block_ids)}", flush=True)
++            return False
++        if len(m.cpu_kv) != len(self.kv_caches):
++            print(f"[v3-restore] layer count mismatch: stored={len(m.cpu_kv)} "
++                  f"current={len(self.kv_caches)}", flush=True)
++            return False
++
++        first_cache = self.kv_caches[0]
++        flash_attn_layout = (first_cache.shape[0] == 2)
++
++        idx = _torch.tensor(target_gpu_block_ids, dtype=_torch.long,
++                            device=first_cache.device)
++
++        for layer_idx, kv_cache in enumerate(self.kv_caches):
++            cpu_t = m.cpu_kv[layer_idx]
++            # Move CPU pinned → GPU (DMA-able since pin_memory=True at capture).
++            gpu_t = cpu_t.to(device=first_cache.device, non_blocking=False)
++            if flash_attn_layout:
++                # gpu_t shape: [2, n_blocks, block_size, num_kv_heads, head_size]
++                # Write into kv_cache[:, target_block_ids, ...].
++                kv_cache.index_copy_(1, idx, gpu_t)
++            else:
++                # gpu_t shape: [n_blocks, 2, block_size, num_kv_heads, head_size]
++                kv_cache.index_copy_(0, idx, gpu_t)
++
++        print(f"[v3-restore] restored memento_id={memento_id!r} -> "
++              f"target_blocks={target_gpu_block_ids[:4]}{'...' if len(target_gpu_block_ids) > 4 else ''} "
++              f"({n_blocks} blocks, {len(self.kv_caches)} layers, "
++              f"{m.cpu_bytes()} bytes)", flush=True)
++        return True
 +
      def _execute_kv_copy_operations(
          self,
