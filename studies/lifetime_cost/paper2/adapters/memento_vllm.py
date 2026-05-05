@@ -208,6 +208,15 @@ class MementoVLLMModel(ChatModel):
         self._masking_enabled = masking_enabled
         self._last_only_masking = last_only_masking
 
+        # v8: env-var gating for the Phase 4a refcount pin. The flag is
+        # read inside the engine subprocess (single_type_kv_cache_manager)
+        # at compaction time. Setting it here propagates to the worker
+        # forks via the standard env inheritance.
+        if not pin_captured_blocks:
+            os.environ["PAPER2_NO_PIN"] = "1"
+        else:
+            os.environ.pop("PAPER2_NO_PIN", None)
+
         if model_name not in MementoVLLMModel._tokenizer_cache:
             from transformers import AutoTokenizer
             MementoVLLMModel._tokenizer_cache[model_name] = AutoTokenizer.from_pretrained(
@@ -251,9 +260,13 @@ class MementoVLLMModel(ChatModel):
                     restart_mode=restart_mode,
                     auto_capture_mementos=auto_capture_mementos,
                     attention_mask_mode=attention_mask_mode,
-                    pin_captured_blocks=pin_captured_blocks,
                     debug=debug_masking,
                 )
+                # v8: pin_captured_blocks gating uses env var PAPER2_NO_PIN
+                # (read inside the engine's compact path), so we don't need
+                # to extend BlockMaskingConfig — that schema is vendored
+                # into the Modal image via a static patch and would require
+                # a rebuild to flip.
             MementoVLLMModel._engine_cache[cache_key] = LLM(**engine_kwargs)
         self._llm = MementoVLLMModel._engine_cache[cache_key]
         self._prev_rendered: str = ""

@@ -1,8 +1,8 @@
 diff --git a/vllm/vllm/config/block_masking.py b/vllm/vllm/config/block_masking.py
-index fda9f45..71bb7c2 100644
+index fda9f45..b143383 100644
 --- a/vllm/vllm/config/block_masking.py
 +++ b/vllm/vllm/config/block_masking.py
-@@ -121,7 +121,26 @@ class BlockMaskingConfig:
+@@ -121,7 +121,33 @@ class BlockMaskingConfig:
      0 = disabled (no cap). When > 0, a logits processor will force the model
      to generate <|block_end|> once a block reaches this many content tokens."""
      debug: bool = False
@@ -26,6 +26,13 @@ index fda9f45..71bb7c2 100644
 +    Suffix tokens never shift positions → prefix cache hits everything,
 +    no cliff. Trade-off: GPU memory grows linearly with conversation
 +    length since obs blocks are never freed."""
++
++    # v8: pin_captured_blocks behavior is gated at runtime via the env var
++    # PAPER2_NO_PIN (read in single_type_kv_cache_manager.py). When set,
++    # Phase 4a's refcount pin is skipped — captured obs KV lives only in
++    # CPU pinned memory (Phase 1A), GPU blocks free naturally. Env-var
++    # gating instead of a config field because BlockMaskingConfig is
++    # vendored into Modal images via a static patch file.
 +
      # Resolved token IDs (set during initialization)
      _block_start_id: Optional[int] = field(default=None, repr=False)
@@ -624,7 +631,7 @@ index 6b0d8fe..5be9cfe 100644
          # Now merge the new span into compacted_spans.
          request.compacted_spans = self._merge_spans(
 diff --git a/vllm/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/vllm/v1/core/single_type_kv_cache_manager.py
-index de7ce2e..ff7f972 100644
+index de7ce2e..9aa82f7 100644
 --- a/vllm/vllm/v1/core/single_type_kv_cache_manager.py
 +++ b/vllm/vllm/v1/core/single_type_kv_cache_manager.py
 @@ -304,7 +304,9 @@ class SingleTypeKVCacheManager(ABC):
@@ -653,11 +660,10 @@ index de7ce2e..ff7f972 100644
          Returns:
 -            Tuple of (blocks_freed, copy_operations) where copy_operations is
 -            a list of (src_block_id, src_offset, dst_block_id, dst_offset).
--        """
 +            Tuple of (blocks_freed, copy_operations, capture_operations).
 +            copy_operations: list of (src_block_id, src_offset, dst_block_id, dst_offset).
 +            capture_operations: list of CaptureOp (block_masking.memento_store).
-+        """
+         """
 +        # Phase 4d-diag: bump engine-stats counter so we can prove
 +        # compact_kv_cache actually fires inside the worker subprocess
 +        # (worker stdout is unreliable under V1; bump() writes inline).
@@ -709,7 +715,7 @@ index de7ce2e..ff7f972 100644
  
          # Build copy plan: list of (src_slot, dst_slot) pairs
          # where src_slot is the current physical location of an active token
-@@ -368,11 +418,64 @@ class SingleTypeKVCacheManager(ABC):
+@@ -368,11 +418,81 @@ class SingleTypeKVCacheManager(ABC):
          # Truncate the blocks list
          del blocks[blocks_needed:]
  
@@ -719,6 +725,16 @@ index de7ce2e..ff7f972 100644
 +        # decrements. Net effect: pinned blocks stay at ref_cnt >= 1
 +        # → not added to free queue → KV bytes preserved on GPU,
 +        # available for splice via attention-mask toggle.
++        #
++        # v8: gated on env var PAPER2_NO_PIN=1 to skip the refcount pin.
++        # When set, Phase 1A still copies KV to CPU pinned memory (the
++        # durable backup), but the GPU blocks free naturally. Recall
++        # path then needs queue_kv_restore to copy CPU→GPU + Phase 3c
++        # block_table splice. (Env-var gating instead of a config field
++        # so we don't need to rebuild the Modal image's vendored overlay
++        # to flip the behavior.)
++        import os as _os
++        _no_pin = _os.environ.get("PAPER2_NO_PIN", "0").lower() in ("1", "true", "yes")
 +        pinned_block_ids: set[int] = set()
 +        if capture_operations:
 +            try:
@@ -728,15 +744,22 @@ index de7ce2e..ff7f972 100644
 +                _bump = None
 +            for op in capture_operations:
 +                pinned_block_ids.update(op.src_block_ids)
-+            for bid in pinned_block_ids:
-+                if 0 <= bid < len(self.block_pool.blocks):
-+                    self.block_pool.blocks[bid].ref_cnt += 1
-+            if _bump is not None:
-+                _bump("pins_applied", len(pinned_block_ids))
-+            print(f"[v3-pin] pinned {len(pinned_block_ids)} GPU blocks "
-+                  f"(refcount++) for memento_id(s)="
-+                  f"{[op.memento_id for op in capture_operations]}",
-+                  flush=True)
++            if not _no_pin:
++                for bid in pinned_block_ids:
++                    if 0 <= bid < len(self.block_pool.blocks):
++                        self.block_pool.blocks[bid].ref_cnt += 1
++                if _bump is not None:
++                    _bump("pins_applied", len(pinned_block_ids))
++                print(f"[v3-pin] pinned {len(pinned_block_ids)} GPU blocks "
++                      f"(refcount++) for memento_id(s)="
++                      f"{[op.memento_id for op in capture_operations]}",
++                      flush=True)
++            else:
++                print(f"[v8-no-pin] PAPER2_NO_PIN=1 — captured KV to CPU "
++                      f"only, GPU blocks ({len(pinned_block_ids)}) will "
++                      f"free naturally for memento_id(s)="
++                      f"{[op.memento_id for op in capture_operations]}",
++                      flush=True)
 +
 +        # Phase 4b: in attention-mask mode, do NOT physically free obs
 +        # blocks. They stay in the request's block_table at original
