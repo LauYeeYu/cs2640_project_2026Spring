@@ -113,8 +113,11 @@ def queue_recall(obs_id: str) -> None:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "a") as f:
             f.write(json.dumps({"obs_id": obs_id}) + "\n")
-    except Exception:
-        pass
+        print(f"[v4e-queue-write] appended {obs_id} → {path}", flush=True)
+    except Exception as e:
+        print(f"[v4e-queue-write-err] {obs_id} → {path}: "
+              f"{type(e).__name__}: {e}",
+              flush=True)
 
 
 def consume_recall(obs_id: str) -> bool:
@@ -126,6 +129,8 @@ def consume_recall(obs_id: str) -> bool:
     """
     path = _recall_queue_path()
     if not os.path.exists(path):
+        print(f"[v4e-consume-MISS-no-file] looked for {obs_id} at {path}",
+              flush=True)
         return False
     queued: list[str] = []
     found = False
@@ -146,7 +151,13 @@ def consume_recall(obs_id: str) -> bool:
     except Exception:
         return False
     if not found:
+        print(f"[v4e-consume-MISS-not-in-queue] looked for {obs_id} at {path}, "
+              f"queue has {len(queued)} entries: {queued[:5]}",
+              flush=True)
         return False
+    print(f"[v4e-consume-HIT] {obs_id} consumed; remaining {len(queued)}: "
+          f"{queued[:5]}",
+          flush=True)
     try:
         tmp = path + ".tmp"
         with open(tmp, "w") as f:
