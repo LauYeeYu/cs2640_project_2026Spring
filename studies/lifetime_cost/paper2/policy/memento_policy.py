@@ -282,7 +282,16 @@ class MementoPolicy(CompactionPolicy):
                 # summarized. We replace it with a one-line ref. The chat
                 # template still renders an asst turn, just without bulky
                 # content/tool_calls.
-                _compact_paired_asst(messages, i)
+                #
+                # SKIP under drop mode: drop+restore relies on vLLM's
+                # content-hash prefix cache finding the obs's pinned KV
+                # blocks. Block hashes are chained through the prefix, so
+                # mutating the asst message preceding the obs would break
+                # the chain → cache miss → re-prefill of obs (defeats the
+                # whole point). Asst is small (~100 tok) anyway; not worth
+                # the trade.
+                if self._recall_mode != "drop":
+                    _compact_paired_asst(messages, i)
             bytes_tagged += len(msg["content"])
             n_fired += 1
             # Project size reduction: obs goes from ~len/4 tokens to
