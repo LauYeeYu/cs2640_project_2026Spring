@@ -133,3 +133,35 @@ under different render structures is the unavoidable confound.
 * Optional follow-on: implement controlled microbenchmark with
   fixed transcript (no trajectory divergence) to measure the v4
   isolated savings — `(recall_count × prefill_tokens_per_obs × per_token_prefill_cost)`.
+
+## Update: 4-seed re-run
+
+Modal run `1777971943`, 48 cells (4 seeds completed before the function
+hit its 3-hour timeout on a degenerate cell — seed 4 off variant on
+psf__requests-3362 went into a long compaction loop). 4-seed result:
+
+```
+variant        wall_s_total  wall_s_mean   comp  rec   res
+off                   312.0         19.5    42    0    4/16
+lru-append            438.7         27.4    44   95    4/16
+lru-attmask           392.7         24.5    80  141    4/16
+```
+
+* **lru-attmask still beats lru-append (-46s, -11%)** with 4 seeds.
+* Engine stats: `recalls_via_unmask: 54 / compactions_seen: 332` (16% recall hit rate).
+* Task-by-task is mixed (lru-append wins on requests-3362 and pytest-5413,
+  lru-attmask wins on pytest-7490 and pylint-5859); std is large.
+
+The 3-seed result (29% reduction) overstates the win; the 4-seed
+average (11%) is more honest. Both numbers are positive — Phase 4e
+does help under recall-heavy workloads — but the gain is task-dependent
+and not as dramatic as the cherry-picked cells suggest.
+
+### Failure mode at scale
+
+The seed-4 stall on `off` requests-3362 is worth flagging. The
+trajectory entered a state where it kept re-firing compaction on the
+same memento_id (obs:8921c90d51447e94) without making forward progress.
+The CPU pinned-memory store grew to 3.5GB; would eventually OOM or
+timeout. Suggests we want a release_pinned_memento policy that drops
+old captures when the agent isn't using them.
