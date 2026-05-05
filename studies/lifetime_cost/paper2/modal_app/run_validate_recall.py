@@ -57,6 +57,8 @@ def run_validate_recall(
     gpu_util: float = 0.92,
     max_model_len: int = 65000,
     attention_mask_mode: bool = False,
+    budget_tokens: int = 24_000,
+    hard_budget_tokens: int = 30_000,
 ) -> dict:
     """Run validate_recall.py inside the Modal container, return summary dict."""
     import json
@@ -84,6 +86,8 @@ def run_validate_recall(
     os.environ["PAPER2_MAX_LEN"] = str(max_model_len)
     os.environ["PAPER2_OUT_DIR"] = str(out_dir)
     os.environ["PAPER2_ATTENTION_MASK_MODE"] = "1" if attention_mask_mode else "0"
+    os.environ["PAPER2_BUDGET_TOKENS"] = str(budget_tokens)
+    os.environ["PAPER2_HARD_BUDGET_TOKENS"] = str(hard_budget_tokens)
 
     print(f"[modal] run_id={run_id}")
     print(f"[modal] instances={instances}")
@@ -125,6 +129,8 @@ def main(
     variants: str = "off,lru,lru-append,embedding,embedding-append",
     max_steps: int = 20,
     attention_mask_mode: bool = False,
+    budget_tokens: int = 24_000,
+    hard_budget_tokens: int = 30_000,
 ):
     """CLI entrypoint — `modal run` calls this."""
     result = run_validate_recall.remote(
@@ -134,6 +140,8 @@ def main(
         variants=variants,
         max_steps=max_steps,
         attention_mask_mode=attention_mask_mode,
+        budget_tokens=budget_tokens,
+        hard_budget_tokens=hard_budget_tokens,
     )
     print()
     print("=" * 70)

@@ -81,6 +81,11 @@ RECALL_VARIANTS = [s.strip() for s in os.environ.get(
 EMBEDDING_THRESHOLD = float(os.environ.get("PAPER2_EMBEDDING_THRESHOLD", "0.40"))
 RECALL_LOW_WATER = float(os.environ.get("PAPER2_RECALL_LOW_WATER", "0.60"))
 RECALL_COOLDOWN = int(os.environ.get("PAPER2_RECALL_COOLDOWN", "3"))
+# Trigger budget: 0.85 * BUDGET_TOKENS; smaller value forces compaction to
+# fire more often. Knob for Phase 7 / drop-mode smokes where we want many
+# compaction events.
+BUDGET_TOKENS = int(os.environ.get("PAPER2_BUDGET_TOKENS", "24000"))
+HARD_BUDGET_TOKENS = int(os.environ.get("PAPER2_HARD_BUDGET_TOKENS", "30000"))
 # Phase 4d: when set to "1"/"true", build the engine with v4 attention-mask
 # mode (compactions skip physical KV move; obs blocks are pinned in
 # block_pool and filtered from the per-step block_table). All variants in
@@ -171,8 +176,8 @@ def _run(task, model, *, variant: str, seed: int = 0):
     traj = run_task(
         task, model, policy,
         benchmark_name="swebench_live",
-        budget_tokens=24_000,
-        hard_budget_tokens=30_000,
+        budget_tokens=BUDGET_TOKENS,
+        hard_budget_tokens=HARD_BUDGET_TOKENS,
         max_completion_tokens=1024,
     )
     wall_total = int((time.perf_counter() - t0) * 1000)
