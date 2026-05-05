@@ -98,8 +98,13 @@ def _build_policy(variant: str) -> MementoPolicy:
     """Build a policy for a named variant.
 
     Variant grammar: `<base>` or `<base>-<mode>`. Base is one of
-    `off|lru|embedding`. Mode is one of `inplace|append`; if omitted it
-    defaults to `inplace` (the v1 behavior). `off` ignores mode.
+    `off|lru|embedding|model`. Mode is one of `inplace|append|attmask`; if
+    omitted it defaults to `inplace` (the v1 behavior). `off` ignores mode.
+
+    The `model` base disables policy-driven recall and exposes a
+    `recall(memento_id)` tool the agent can call deliberately. Mode in
+    that case must be `attmask` so the recalled obs comes back via
+    Phase 4e KV unmask (no re-prefill).
     """
     if "-" in variant:
         base, mode = variant.split("-", 1)
@@ -129,6 +134,19 @@ def _build_policy(variant: str) -> MementoPolicy:
             recall_strategy_kwargs={"threshold": EMBEDDING_THRESHOLD},
             recall_mode=mode,
         )
+    if base == "model":
+        if mode != "attmask":
+            raise ValueError(
+                f"variant 'model-{mode}' requires mode='attmask' "
+                f"(KV unmask is the only zero-prefill recall path)"
+            )
+        return MementoPolicy(
+            min_obs_chars=300,
+            # No policy-driven recall — the model decides via the tool.
+            recall_enabled=False,
+            recall_mode=mode,
+            recall_tool_enabled=True,
+        )
     raise ValueError(f"unknown variant: {variant!r}")
 
 
@@ -139,6 +157,15 @@ def _run(task, model, *, variant: str, seed: int = 0):
 
     # Override the model's default_seed for this run
     model._default_seed = seed
+
+    # Flush any stale recall_queue entries from prior cells. The queue is a
+    # global file shared across the engine subprocess and the main proc; we
+    # don't want hashes from a previous task accidentally matching here.
+    try:
+        from vllm.v1.core.block_masking.memento_store import reset_recall_queue
+        reset_recall_queue()
+    except Exception:
+        pass
 
     t0 = time.perf_counter()
     traj = run_task(

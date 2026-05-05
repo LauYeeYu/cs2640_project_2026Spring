@@ -25,7 +25,7 @@ import json
 import time
 from typing import Callable, List, Optional
 
-from .benchmarks.base import Task
+from .benchmarks.base import Task, ToolEnv
 from .models.base import ChatModel
 from .policies.base import CompactionContext, CompactionPolicy
 from .tokenization import Tokenizer, count_messages, get_tokenizer
@@ -99,7 +99,38 @@ def run_task(
     # bakes (validate_recall.py) see corrupted starting state across runs.
     import copy
     messages = copy.deepcopy(task.messages_init)
-    tools_schema = task.tool_env.schemas() or None
+
+    # Phase 5: let the policy contribute extra tools (e.g. a `recall(mem_id)`
+    # tool that depends on this run's model adapter) and an addendum to the
+    # system prompt explaining how to use them. Build a scoped tool_env that
+    # wraps the task's tools + extras so we don't mutate task.tool_env (the
+    # same Task object is reused across variants in validate_recall).
+    extra_tools: List = []
+    get_extra_tool = getattr(policy, "get_recall_tool", None)
+    if callable(get_extra_tool):
+        queue_recall = getattr(model, "queue_recall", None)
+        if callable(queue_recall):
+            extra = get_extra_tool(queue_recall)
+            if extra is not None:
+                extra_tools.append(extra)
+    if extra_tools:
+        base_tools = list(task.tool_env._tools.values())
+        tool_env = ToolEnv(base_tools + extra_tools)
+    else:
+        tool_env = task.tool_env
+
+    get_addendum = getattr(policy, "get_system_prompt_addendum", None)
+    if callable(get_addendum):
+        addendum = get_addendum()
+        if addendum:
+            for m in messages:
+                if m.get("role") == "system":
+                    m["content"] = (m.get("content") or "") + "\n\n" + addendum
+                    break
+            else:
+                messages.insert(0, {"role": "system", "content": addendum})
+
+    tools_schema = tool_env.schemas() or None
 
     final_answer: Optional[str] = None
     done = False
@@ -154,7 +185,7 @@ def run_task(
                 fn = tc.get("function") or {}
                 name = fn.get("name", "")
                 args = _coerce_args(fn.get("arguments"))
-                obs = task.tool_env.call(name, args)
+                obs = tool_env.call(name, args)
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.get("id", ""),

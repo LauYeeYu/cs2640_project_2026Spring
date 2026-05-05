@@ -24,12 +24,13 @@ compaction.
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # Pipeline imports (relative — works in both worktree and editable installs).
 from ...pipeline.policies.base import CompactionContext, CompactionPolicy
 from ...pipeline.types import CompactionEvent
 from ...pipeline.tokenization import count_messages
+from ...pipeline.benchmarks.base import Tool
 
 from ..memento_writer import HaikuMementoWriter
 from .recall_strategy import RecallStrategy, build_recall_strategy
@@ -71,6 +72,7 @@ class MementoPolicy(CompactionPolicy):
         recall_strategy_kwargs: Optional[Dict[str, Any]] = None,
         recall_query_window: int = 4,
         recall_mode: str = "inplace",
+        recall_tool_enabled: bool = False,
         writer: Optional[HaikuMementoWriter] = None,
         memento_model: str = "claude-haiku-4-5",
         max_obs_chars: int = 8000,
@@ -101,6 +103,13 @@ class MementoPolicy(CompactionPolicy):
         self._writer = writer or HaikuMementoWriter(
             model=memento_model, max_obs_chars=max_obs_chars
         )
+        # Phase 5: model-controlled recall. When enabled, every memento we
+        # generate gets tagged `[memento_id=mem-N]` and the original obs is
+        # registered in `_recall_table`. A `recall(memento_id)` tool exposed
+        # to the model lets it deliberately bring back the full obs by id.
+        self._recall_tool_enabled = recall_tool_enabled
+        self._recall_table: Dict[str, str] = {}
+        self._memento_counter: int = 0
 
     def _estimate_tokens(self, messages: List[Dict[str, Any]], ctx: CompactionContext) -> int:
         """Use the runner-provided tokenizer for total context estimate."""
@@ -232,10 +241,20 @@ class MementoPolicy(CompactionPolicy):
                     tool_name=tool_name,
                     tool_args=tool_args,
                 )
-                msg["memento"] = text
                 in_toks_total += usage.input_tokens
                 out_toks_total += usage.output_tokens
                 cost_total += usage.cost_usd
+                # Phase 5: tag every freshly-written memento with a stable
+                # `mem-N` id so the model can refer to it via the recall
+                # tool. The full obs is registered in _recall_table so the
+                # tool handler can look it up and queue_recall(obs_text).
+                if self._recall_tool_enabled:
+                    self._memento_counter += 1
+                    mem_id = f"mem-{self._memento_counter}"
+                    text = f"[memento_id={mem_id}]\n{text}"
+                    self._recall_table[mem_id] = msg["content"]
+                    msg["memento_id"] = mem_id
+                msg["memento"] = text
             bytes_tagged += len(msg["content"])
             n_fired += 1
             # Project size reduction: obs goes from ~len/4 tokens to
@@ -375,6 +394,80 @@ class MementoPolicy(CompactionPolicy):
             wallclock_ms=wall_ms,
         )
         return new_messages, evt
+
+
+    def get_recall_tool(self, queue_recall_fn: Callable[[str], Optional[str]]) -> Optional[Tool]:
+        """Phase 5: build a `recall(memento_id)` Tool the model can call.
+
+        The handler looks up the obs text by memento_id in `_recall_table`
+        and forwards it to `queue_recall_fn` (the model adapter's
+        `queue_recall`), which writes the obs hash into the engine's IPC
+        queue so the next compaction skips masking it.
+
+        Returns None when recall_tool_enabled=False so callers can wire
+        this up unconditionally.
+        """
+        if not self._recall_tool_enabled:
+            return None
+
+        def _handle(args: Dict[str, Any]) -> str:
+            mem_id = args.get("memento_id") or args.get("id") or ""
+            if not isinstance(mem_id, str) or not mem_id:
+                return "[recall error] memento_id is required (e.g. 'mem-3')"
+            obs_text = self._recall_table.get(mem_id)
+            if obs_text is None:
+                known = sorted(self._recall_table.keys())
+                return (f"[recall error] no memento with id={mem_id!r}. "
+                        f"Known: {known[-10:] if known else 'none yet'}")
+            try:
+                queue_recall_fn(obs_text)
+            except Exception as e:
+                return f"[recall error] queue_recall failed: {type(e).__name__}: {e}"
+            return (f"OK: queued recall for {mem_id}. The full original observation "
+                    f"will be visible again on the next assistant turn.")
+
+        return Tool(
+            name="recall",
+            description=(
+                "Bring back the full text of a previously summarized observation. "
+                "Earlier tool messages may have been replaced by a short memento "
+                "summary tagged `[memento_id=mem-N]`. Calling recall(memento_id=\"mem-N\") "
+                "asks the cache layer to make the original observation visible again "
+                "to the model on the NEXT assistant turn — no re-fetch needed. Use "
+                "this when the summary isn't enough and you need exact details."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "memento_id": {
+                        "type": "string",
+                        "description": "The mem-N id from a `[memento_id=mem-N]` tag in a memento."
+                    }
+                },
+                "required": ["memento_id"],
+            },
+            fn=_handle,
+        )
+
+    def get_system_prompt_addendum(self) -> Optional[str]:
+        """Phase 5: extra system-prompt text the runner should append when
+        the recall tool is exposed. Tells the model the convention so it
+        can use the tool effectively without a one-shot example."""
+        if not self._recall_tool_enabled:
+            return None
+        return (
+            "Memory note: when context fills up, older tool observations may "
+            "be auto-summarized. A summarized observation looks like:\n"
+            "  [tool_response, evicted, memento]\n"
+            "  [memento_id=mem-3]\n"
+            "  <short summary>\n"
+            "If you later need the EXACT contents of that observation (e.g. "
+            "specific code, error text, file lines), call the `recall` tool "
+            "with that memento_id. The full original observation will reappear "
+            "on your next turn at near-zero cost — much cheaper than re-running "
+            "the original tool. Don't recall pre-emptively; only when the "
+            "summary alone is genuinely insufficient."
+        )
 
 
 def _trace_tool_call(

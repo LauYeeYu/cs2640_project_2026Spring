@@ -43,6 +43,12 @@ class ToolEnv:
     def __init__(self, tools: List[Tool]):
         self._tools = {t.name: t for t in tools}
 
+    def add(self, *tools: Tool) -> None:
+        """Inject extra tools post-construction (e.g. a policy-provided
+        `recall` tool that depends on the runner's model adapter)."""
+        for t in tools:
+            self._tools[t.name] = t
+
     def schemas(self) -> List[Dict[str, Any]]:
         return [t.to_openai() for t in self._tools.values()]
 
