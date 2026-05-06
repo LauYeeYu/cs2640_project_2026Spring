@@ -265,6 +265,13 @@ def main():
     print(f"tasks: {[t.id for t in tasks]}")
 
     print(f"attention_mask_mode: {ATTENTION_MASK_MODE}")
+    # Auto-capture mementos at compaction is needed by:
+    #   - attmask mode (Phase 4d): blocks get refcount-pinned via capture_specs
+    #   - kvrestore mode (Phase 3c+9): captured CPU KV is what we restore on
+    #     recall; without capture there's nothing to restore.
+    needs_capture = ATTENTION_MASK_MODE or any(
+        "kvrestore" in v for v in RECALL_VARIANTS
+    )
     model = MementoVLLMModel(
         model_name=MODEL,
         gpu_memory_utilization=GPU_MEM_UTIL,
@@ -273,10 +280,7 @@ def main():
         debug_masking=False,
         temperature=TEMPERATURE,
         attention_mask_mode=ATTENTION_MASK_MODE,
-        # Phase 4d: in attmask mode we want capture so blocks are pinned —
-        # otherwise mask_token_span has no capture_specs and Phase 4b
-        # short-circuit can't fire.
-        auto_capture_mementos=ATTENTION_MASK_MODE,
+        auto_capture_mementos=needs_capture,
         # Phase 4d-diag: under last_only_masking=True the renderer puts
         # markers only on the LAST tool message — but the last tool msg
         # is always fresh (no memento yet), so markers are never in the
