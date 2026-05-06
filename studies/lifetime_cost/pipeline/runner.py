@@ -137,6 +137,8 @@ def run_task(
     step_idx = 0
 
     while not done and step_idx < task.max_steps:
+        _step_t0 = time.perf_counter()
+        print(f"[runner] step={step_idx} START", flush=True)
         # Recall hook fires BEFORE chat — gives the policy a chance to swap
         # an inlined memento back to its full obs so the model sees the
         # bytes it needs this turn.
@@ -147,7 +149,12 @@ def run_task(
             tokenizer=tokenizer,
             summarizer=summarizer,
         )
+        _recall_t0 = time.perf_counter()
         messages, recall_event = policy.maybe_recall(messages, recall_ctx)
+        print(f"[runner] step={step_idx} maybe_recall done "
+              f"in {(time.perf_counter()-_recall_t0)*1000:.0f}ms "
+              f"event={'yes' if recall_event else 'no'}",
+              flush=True)
 
         # Phase 4e: drain attmask recall hints staged by the policy and
         # push them into the engine via the model adapter. Each entry is
@@ -193,12 +200,18 @@ def run_task(
                         pass
 
         t0 = time.perf_counter()
+        print(f"[runner] step={step_idx} chat() ENTER "
+              f"n_messages={len(messages)}",
+              flush=True)
         resp = model.chat(
             messages,
             tools=tools_schema,
             max_tokens=max_completion_tokens,
         )
         wall_ms = int((time.perf_counter() - t0) * 1000)
+        print(f"[runner] step={step_idx} chat() EXIT in {wall_ms}ms "
+              f"n_tool_calls={len(resp.tool_calls or [])}",
+              flush=True)
 
         # Phase 7: any tool message that was freshly mementoed BEFORE this
         # chat just had its full obs sent through the engine, which (under
@@ -245,7 +258,16 @@ def run_task(
             tokenizer=tokenizer,
             summarizer=summarizer,
         )
+        _comp_t0 = time.perf_counter()
+        print(f"[runner] step={step_idx} maybe_compact ENTER", flush=True)
         messages, comp_event = policy.maybe_compact(messages, ctx)
+        print(f"[runner] step={step_idx} maybe_compact EXIT "
+              f"in {(time.perf_counter()-_comp_t0)*1000:.0f}ms "
+              f"event={'yes' if comp_event else 'no'}",
+              flush=True)
+        print(f"[runner] step={step_idx} END "
+              f"total={(time.perf_counter()-_step_t0)*1000:.0f}ms",
+              flush=True)
 
         traj.steps.append(Step(
             index=step_idx,

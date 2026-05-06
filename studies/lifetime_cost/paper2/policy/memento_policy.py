@@ -374,8 +374,20 @@ class MementoPolicy(CompactionPolicy):
         # what the engine actually sees, not the raw conversation size.
         total_tok = self._rendered_token_estimate(messages, ctx)
         low_water = int(self._recall_low_water_ratio * ctx.budget)
+        n_memento = sum(
+            1 for m in messages
+            if m.get("role") == "tool" and m.get("memento")
+        )
         if total_tok >= low_water:
+            print(f"[policy-recall] step={ctx.step} SKIP: "
+                  f"total_tok={total_tok} >= low_water={low_water} "
+                  f"(n_memento'd={n_memento})",
+                  flush=True)
             return messages, None
+        print(f"[policy-recall] step={ctx.step} eligible: "
+              f"total_tok={total_tok} < low_water={low_water} "
+              f"n_memento'd={n_memento} mode={self._recall_mode}",
+              flush=True)
 
         # Build a content-aware "query" for the strategy: the trailing
         # assistant/tool/user content. LRU ignores it; embedding-similarity
@@ -386,7 +398,13 @@ class MementoPolicy(CompactionPolicy):
         )
 
         if target_idx is None:
+            print(f"[policy-recall] step={ctx.step} SKIP: "
+                  f"strategy.pick returned None (no eligible candidates)",
+                  flush=True)
             return messages, None
+        print(f"[policy-recall] step={ctx.step} picked target_idx={target_idx} "
+              f"(memento_step={messages[target_idx].get('memento_step')})",
+              flush=True)
 
         t0 = time.perf_counter()
         msg = messages[target_idx]
@@ -445,10 +463,18 @@ class MementoPolicy(CompactionPolicy):
                 if expected_obs_id and expected_obs_id not in captured:
                     # Engine hasn't captured this obs yet; skip recall to
                     # avoid losing the memento. Try again next step.
+                    print(f"[policy-recall] step={ctx.step} SKIP: "
+                          f"target obs_id={expected_obs_id} not yet captured "
+                          f"(captured set has {len(captured)} obs)",
+                          flush=True)
                     return messages, None
                 m_obs = ctx.tokenizer.count(obs)
                 p_placeholder = ctx.tokenizer.count(memento_text)
                 delta = m_obs - p_placeholder
+                print(f"[policy-recall] step={ctx.step} FIRING: "
+                      f"obs_id={expected_obs_id} delta={delta} "
+                      f"m_obs={m_obs} p_placeholder={p_placeholder}",
+                      flush=True)
                 self._pending_kvrestore_recalls.append((obs, delta))
             msg["prior_memento"] = msg.get("memento")
             msg["memento"] = None

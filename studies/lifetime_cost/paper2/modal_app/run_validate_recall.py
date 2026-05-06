@@ -79,6 +79,8 @@ def run_validate_recall(
     # unset → mismatched NONE_HASH across procs → dual-key inserts
     # would never hit. This MUST be set BEFORE any vLLM import.
     os.environ["PYTHONHASHSEED"] = "1"
+    # Phase 9: heartbeat every 15s so engine hangs are visible.
+    os.environ.setdefault("PAPER2_HEARTBEAT_SEC", "15")
 
     # Per-run output dir on the persistent volume.
     run_id = int(time.time())

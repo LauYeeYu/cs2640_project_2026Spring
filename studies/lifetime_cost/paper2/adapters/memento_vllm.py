@@ -354,6 +354,9 @@ class MementoVLLMModel(ChatModel):
         prompt_token_ids = self._tokenizer(rendered, add_special_tokens=False).input_ids
         prompt_tokens = len(prompt_token_ids)
         cached_tokens = int(prompt_tokens * (prefix_chars / max(len(rendered), 1)))
+        print(f"[adapter] chat() prompt_tokens={prompt_tokens} "
+              f"cached~{cached_tokens} → vLLM.generate ENTER",
+              flush=True)
 
         eff_temp = temperature if temperature is not None else self._default_temperature
         sp_kwargs: Dict[str, Any] = {
@@ -363,12 +366,17 @@ class MementoVLLMModel(ChatModel):
         if self._default_seed is not None:
             sp_kwargs["seed"] = self._default_seed
         sp = SamplingParams(**sp_kwargs)
+        import time as _time
+        _gen_t0 = _time.perf_counter()
         try:
             outs = self._llm.generate(
                 prompts=[{"prompt_token_ids": prompt_token_ids}],
                 sampling_params=sp,
                 use_tqdm=False,
             )
+            print(f"[adapter] vLLM.generate EXIT in "
+                  f"{(_time.perf_counter()-_gen_t0)*1000:.0f}ms",
+                  flush=True)
         except ValueError as e:
             if "longer than the maximum" not in str(e):
                 raise
