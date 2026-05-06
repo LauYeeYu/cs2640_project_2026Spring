@@ -618,6 +618,73 @@ index 0000000..b7201ba
 +    request_id: str
 +    suffix_block_ids: list[int]   # blocks AFTER the spliced obs region
 +    delta_tokens: int             # signed; typically positive on recall
+diff --git a/vllm/vllm/v1/core/block_masking/tracker.py b/vllm/vllm/v1/core/block_masking/tracker.py
+index 8078b47..881e86d 100644
+--- a/vllm/vllm/v1/core/block_masking/tracker.py
++++ b/vllm/vllm/v1/core/block_masking/tracker.py
+@@ -226,6 +226,7 @@ class BlockMaskingState:
+         keep_last_n: int,
+         mask_delimiters: bool = False,
+         restart_mode: bool = False,
++        max_end: int = -1,
+     ) -> Optional[tuple[int, int]]:
+         """
+         Get the next compaction range if one is ready.
+@@ -250,26 +251,39 @@ class BlockMaskingState:
+         if keep_last_n < 0:
+             # Never compact
+             return None
+-        
++
+         num_pending = len(self.pending_compactions)
+-        
++
+         # Only compact if we have more pending than keep_last_n
+         if num_pending <= keep_last_n:
+             return None
+-        
+-        # Get the oldest pending block
+-        block_id = self.pending_compactions.pop(0)
+-        block = self.blocks[block_id]
+-        
+-        if restart_mode:
+-            # Restart mode: evict block content + summary
+-            content_range = block.get_restart_range(mask_delimiters=mask_delimiters)
+-        else:
+-            # Normal mode: evict only block content
+-            content_range = block.get_content_range(mask_delimiters=mask_delimiters)
+-        if content_range is None:
++
++        # Phase 9: scan pending_compactions for the OLDEST one whose end
++        # is within num_computed. The scheduler's mask_token_span fails
++        # with `end > num_computed` if we pop blindly — losing that
++        # compaction forever. Pop the first ready one; leave the rest.
++        chosen_idx = -1
++        chosen_range = None
++        for idx, bid in enumerate(self.pending_compactions):
++            block = self.blocks[bid]
++            if restart_mode:
++                rng = block.get_restart_range(mask_delimiters=mask_delimiters)
++            else:
++                rng = block.get_content_range(mask_delimiters=mask_delimiters)
++            if rng is None:
++                continue
++            s, e = rng
++            if max_end >= 0 and e > max_end:
++                continue
++            chosen_idx = idx
++            chosen_range = rng
++            break
++        if chosen_idx < 0:
+             return None
+-        
++        block_id = self.pending_compactions.pop(chosen_idx)
++        content_range = chosen_range
++        block = self.blocks[block_id]
++
+         start, end = content_range
+         
+         # NOTE: Return LOGICAL positions, not adjusted positions!
 diff --git a/vllm/vllm/v1/core/block_pool.py b/vllm/vllm/v1/core/block_pool.py
 index cc42bad..dc55c6c 100644
 --- a/vllm/vllm/v1/core/block_pool.py
@@ -785,7 +852,7 @@ index db7a4d2..c703037 100644
      # block masking compactions. These requests will do prefill only,
      # allowing compaction to run before the first decode token.
 diff --git a/vllm/vllm/v1/core/sched/scheduler.py b/vllm/vllm/v1/core/sched/scheduler.py
-index 6b0d8fe..8b14147 100644
+index 6b0d8fe..c0952cf 100644
 --- a/vllm/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/vllm/v1/core/sched/scheduler.py
 @@ -185,10 +185,37 @@ class Scheduler(SchedulerInterface):
@@ -933,7 +1000,15 @@ index 6b0d8fe..8b14147 100644
              skip_sampling_req_ids=skip_sampling_req_ids,
          )
  
-@@ -1259,6 +1371,8 @@ class Scheduler(SchedulerInterface):
+@@ -1252,6 +1364,7 @@ class Scheduler(SchedulerInterface):
+                         self.block_masking_config.keep_last_n_blocks,
+                         mask_delimiters=self.block_masking_config.mask_delimiters,
+                         restart_mode=self.block_masking_config.restart_mode,
++                        max_end=request.num_computed_tokens,
+                     )
+                     while compaction:
+                         start, end = compaction
+@@ -1259,6 +1372,8 @@ class Scheduler(SchedulerInterface):
                              request.request_id,
                              start,
                              end,
@@ -942,7 +1017,15 @@ index 6b0d8fe..8b14147 100644
                          )
                          if (self.block_masking_config is not None and
                              self.block_masking_config.debug):
-@@ -1469,6 +1583,8 @@ class Scheduler(SchedulerInterface):
+@@ -1285,6 +1400,7 @@ class Scheduler(SchedulerInterface):
+                             self.block_masking_config.keep_last_n_blocks,
+                             mask_delimiters=self.block_masking_config.mask_delimiters,
+                             restart_mode=self.block_masking_config.restart_mode,
++                            max_end=request.num_computed_tokens,
+                         )
+                     # Reset the flag after deferred compaction completes
+                     state.deferred_compaction_scheduled = False
+@@ -1469,6 +1585,8 @@ class Scheduler(SchedulerInterface):
                          request.request_id,
                          start,
                          end,
@@ -951,7 +1034,15 @@ index 6b0d8fe..8b14147 100644
                      )
                      if (self.block_masking_config is not None and
                          self.block_masking_config.debug):
-@@ -1510,6 +1626,8 @@ class Scheduler(SchedulerInterface):
+@@ -1486,6 +1604,7 @@ class Scheduler(SchedulerInterface):
+                         self.block_masking_config.keep_last_n_blocks,
+                         mask_delimiters=self.block_masking_config.mask_delimiters,
+                         restart_mode=self.block_masking_config.restart_mode,
++                        max_end=request.num_computed_tokens,
+                     )
+         
+         for num_new, output_token_id in enumerate(new_token_ids, 1):
+@@ -1510,6 +1629,8 @@ class Scheduler(SchedulerInterface):
                          request.request_id,
                          start,
                          end,
@@ -960,7 +1051,7 @@ index 6b0d8fe..8b14147 100644
                      )
                      if (self.block_masking_config is not None and
                          self.block_masking_config.debug):
-@@ -1598,7 +1716,7 @@ class Scheduler(SchedulerInterface):
+@@ -1598,7 +1719,7 @@ class Scheduler(SchedulerInterface):
      def add_request(self, request: Request) -> None:
          self.waiting.add_request(request)
          self.requests[request.request_id] = request
@@ -969,7 +1060,7 @@ index 6b0d8fe..8b14147 100644
          # Initialize block masking state if enabled
          if self.block_masking_processor is not None:
              request.block_masking_state = self.block_masking_processor.create_state()
-@@ -1608,6 +1726,28 @@ class Scheduler(SchedulerInterface):
+@@ -1608,6 +1729,28 @@ class Scheduler(SchedulerInterface):
                      request.block_masking_state,
                      request.prompt_token_ids,
                  )
@@ -998,7 +1089,7 @@ index 6b0d8fe..8b14147 100644
          
          if self.log_stats:
              request.record_event(EngineCoreEventType.QUEUED)
-@@ -1759,11 +1899,334 @@ class Scheduler(SchedulerInterface):
+@@ -1759,11 +1902,334 @@ class Scheduler(SchedulerInterface):
                  merged.append((start, end))
          return merged
  
@@ -1333,7 +1424,7 @@ index 6b0d8fe..8b14147 100644
      ) -> SpanRemovalResult:
          """Mask a span of tokens and compact the KV cache in one step.
  
-@@ -1776,6 +2239,11 @@ class Scheduler(SchedulerInterface):
+@@ -1776,6 +2242,11 @@ class Scheduler(SchedulerInterface):
              request_id: The request ID.
              start_position: Start logical position (inclusive).
              end_position: End logical position (exclusive).
@@ -1345,7 +1436,7 @@ index 6b0d8fe..8b14147 100644
  
          Returns:
              SpanRemovalResult with success status, tokens removed, and
-@@ -1808,6 +2276,10 @@ class Scheduler(SchedulerInterface):
+@@ -1808,6 +2279,10 @@ class Scheduler(SchedulerInterface):
              )
  
          if end_position > request.num_computed_tokens:
@@ -1356,7 +1447,7 @@ index 6b0d8fe..8b14147 100644
              return SpanRemovalResult(
                  success=False,
                  tokens_removed=0,
-@@ -1839,6 +2311,10 @@ class Scheduler(SchedulerInterface):
+@@ -1839,6 +2314,10 @@ class Scheduler(SchedulerInterface):
              active_logical.extend(range(prev_end, num_computed))
  
          if not active_logical:
@@ -1367,7 +1458,7 @@ index 6b0d8fe..8b14147 100644
              return SpanRemovalResult(
                  success=False,
                  tokens_removed=0,
-@@ -1854,20 +2330,114 @@ class Scheduler(SchedulerInterface):
+@@ -1854,20 +2333,114 @@ class Scheduler(SchedulerInterface):
              request.logical_to_physical(p) for p in active_logical
          ]
  
