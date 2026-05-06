@@ -192,13 +192,16 @@ def _run(task, model, *, variant: str, seed: int = 0):
             reset_captured_obs,
             reset_kv_restore_queue,
             reset_dual_key_queue,
-            reset_global_memento_store,
         )
+        # IPC resets only — these are filesystem and visible to the engine
+        # subprocess. (reset_global_memento_store is process-local and
+        # only affects the main proc's singleton; engine still has its
+        # own. Mismatched store/queue would cause hash-lookup misses
+        # rather than crashes anyway.)
         reset_recall_queue()
         reset_captured_obs()
         reset_kv_restore_queue()
         reset_dual_key_queue()
-        reset_global_memento_store()
     except Exception:
         pass
 
