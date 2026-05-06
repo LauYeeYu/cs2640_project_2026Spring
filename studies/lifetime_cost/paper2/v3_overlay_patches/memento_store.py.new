@@ -25,6 +25,27 @@ from typing import Optional
 import torch
 
 
+# Phase 9: registry for block_pool so heartbeat + GPU mem trace can
+# sample get_num_free_blocks() — the true measure of "release", since
+# torch.cuda.memory_allocated stays flat (vLLM pre-allocates the pool).
+_GLOBAL_BLOCK_POOL = None
+
+
+def register_block_pool(block_pool) -> None:
+    global _GLOBAL_BLOCK_POOL
+    _GLOBAL_BLOCK_POOL = block_pool
+
+
+def get_num_free_blocks_or_neg1() -> int:
+    bp = _GLOBAL_BLOCK_POOL
+    if bp is None:
+        return -1
+    try:
+        return int(bp.get_num_free_blocks())
+    except Exception:
+        return -1
+
+
 # Process-global engine-side counters. Incremented by the worker at the
 # call sites listed in the comment. Dumped to disk via atexit so we can
 # verify (post-bake) that v4 plumbing actually fired in the worker
