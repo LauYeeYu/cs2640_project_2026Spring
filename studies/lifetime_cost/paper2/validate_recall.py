@@ -276,6 +276,12 @@ def main():
     needs_capture = ATTENTION_MASK_MODE or any(
         "kvrestore" in v for v in RECALL_VARIANTS
     )
+    # Phase 9: respect PAPER2_NO_PIN env var (set by Modal entrypoint --no-pin
+    # flag) so the adapter doesn't clobber it when constructing the engine.
+    # pin_captured_blocks=False → adapter sets PAPER2_NO_PIN=1 → engine
+    # skips Phase 4a refcount pin, captured blocks become eviction-eligible.
+    pin_captured = os.environ.get("PAPER2_NO_PIN", "0").lower() not in ("1", "true", "yes")
+    print(f"pin_captured_blocks: {pin_captured}")
     model = MementoVLLMModel(
         model_name=MODEL,
         gpu_memory_utilization=GPU_MEM_UTIL,
@@ -285,6 +291,7 @@ def main():
         temperature=TEMPERATURE,
         attention_mask_mode=ATTENTION_MASK_MODE,
         auto_capture_mementos=needs_capture,
+        pin_captured_blocks=pin_captured,
         # Phase 4d-diag: under last_only_masking=True the renderer puts
         # markers only on the LAST tool message — but the last tool msg
         # is always fresh (no memento yet), so markers are never in the
