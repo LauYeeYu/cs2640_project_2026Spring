@@ -61,6 +61,7 @@ def run_validate_recall(
     hard_budget_tokens: int = 30_000,
     recall_low_water: float = 0.60,
     no_pin: bool = False,
+    profile_mem: bool = False,
 ) -> dict:
     """Run validate_recall.py inside the Modal container, return summary dict."""
     import json
@@ -79,15 +80,26 @@ def run_validate_recall(
     # unset → mismatched NONE_HASH across procs → dual-key inserts
     # would never hit. This MUST be set BEFORE any vLLM import.
     os.environ["PYTHONHASHSEED"] = "1"
-    # Phase 9: heartbeat every 15s so engine hangs are visible.
-    os.environ.setdefault("PAPER2_HEARTBEAT_SEC", "15")
+    # Phase 9: heartbeat thread is OFF by default — its periodic
+    # block_pool.get_num_free_blocks() call from a side thread races
+    # with the main thread during warmup (suspected) and triggers
+    # `assert total_num_scheduled_tokens > 0` in _prepare_inputs.
+    # Turn on only for explicit profiling runs via `--profile-mem`.
+    if profile_mem:
+        os.environ["PAPER2_HEARTBEAT_SEC"] = "15"
+    else:
+        os.environ.pop("PAPER2_HEARTBEAT_SEC", None)
 
     # Per-run output dir on the persistent volume.
     run_id = int(time.time())
     out_dir = Path(f"/scratch/out/validate_recall/{run_id}")
     out_dir.mkdir(parents=True, exist_ok=True)
-    # Phase 9: GPU memory trace per Phase 9 event + heartbeat.
-    os.environ["PAPER2_GPU_MEM_TRACE_PATH"] = str(out_dir / "gpu_mem_trace.jsonl")
+    # Phase 9: GPU memory trace per Phase 9 event. Same warmup-race risk
+    # as the heartbeat — gated on --profile-mem.
+    if profile_mem:
+        os.environ["PAPER2_GPU_MEM_TRACE_PATH"] = str(out_dir / "gpu_mem_trace.jsonl")
+    else:
+        os.environ.pop("PAPER2_GPU_MEM_TRACE_PATH", None)
 
     # Wire env knobs that validate_recall.py reads on import.
     os.environ["PAPER2_INSTANCES"] = instances
@@ -151,6 +163,7 @@ def main(
     hard_budget_tokens: int = 30_000,
     recall_low_water: float = 0.60,
     no_pin: bool = False,
+    profile_mem: bool = False,
     max_model_len: int = 65_000,
 ):
     """CLI entrypoint — `modal run` calls this."""
@@ -165,6 +178,7 @@ def main(
         hard_budget_tokens=hard_budget_tokens,
         recall_low_water=recall_low_water,
         no_pin=no_pin,
+        profile_mem=profile_mem,
         max_model_len=max_model_len,
     )
     print()
