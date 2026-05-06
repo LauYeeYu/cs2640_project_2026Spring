@@ -64,7 +64,14 @@ class LRURecall(RecallStrategy):
 
     def pick(self, messages, *, step, recent_text):
         cands = self._candidate_indices(messages, step=step)
-        return cands[-1] if cands else None
+        # Phase 9 alignment: pick the OLDEST memento'd msg (cands[0]).
+        # The engine's masking processor reliably re-compacts the FIRST
+        # marker pair in the prompt every chat (it gets re-added to
+        # pending_compactions on each re-prefill). So that's the obs the
+        # engine has captured most reliably under its content hash. Using
+        # cands[-1] (newest) instead picked an obs the engine may not have
+        # gotten around to capturing yet — splice would fail.
+        return cands[0] if cands else None
 
 
 class EmbeddingRecall(RecallStrategy):
