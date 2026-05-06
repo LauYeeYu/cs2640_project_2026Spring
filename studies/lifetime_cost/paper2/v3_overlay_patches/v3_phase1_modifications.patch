@@ -557,6 +557,27 @@ index 0000000..cfefa78
 +    request_id: str
 +    suffix_block_ids: list[int]   # blocks AFTER the spliced obs region
 +    delta_tokens: int             # signed; typically positive on recall
+diff --git a/vllm/vllm/v1/core/block_pool.py b/vllm/vllm/v1/core/block_pool.py
+index cc42bad..dc55c6c 100644
+--- a/vllm/vllm/v1/core/block_pool.py
++++ b/vllm/vllm/v1/core/block_pool.py
+@@ -255,7 +255,15 @@ class BlockPool:
+             [] if self.enable_kv_cache_events else None
+         )
+         for i, blk in enumerate(new_full_blocks):
+-            assert blk.block_hash is None
++            # Paper 2 Phase 9: Skip blocks that already have a hash. After a
++            # kvrestore splice, the request's block_table contains suffix
++            # blocks that were cached during the compacted period — they
++            # already have block_hash set. The upstream assertion would fire
++            # on them when allocate_slots later tries to cache the full
++            # range. Treating already-cached blocks as no-ops preserves
++            # their existing hash entries in cached_block_hash_to_block.
++            if blk.block_hash is not None:
++                continue
+             block_hash = new_block_hashes[i]
+ 
+             # Update and added the full block to the cache.
 diff --git a/vllm/vllm/v1/core/kv_cache_coordinator.py b/vllm/vllm/v1/core/kv_cache_coordinator.py
 index d8acac0..4c0ff07 100644
 --- a/vllm/vllm/v1/core/kv_cache_coordinator.py
