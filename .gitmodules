@@ -1,0 +1,6 @@
+[submodule "LauYeeYu/src/libCacheSim"]
+	path = LauYeeYu/src/libCacheSim
+	url = https://github.com/LauYeeYu/libCacheSim.git
+[submodule "LauYeeYu/src/vllm"]
+	path = LauYeeYu/src/vllm
+	url = https://github.com/LauYeeYu/vllm.git
