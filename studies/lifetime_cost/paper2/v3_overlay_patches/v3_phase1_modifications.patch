@@ -79,10 +79,10 @@ index 37c8bbd..413d091 100644
  ]
 diff --git a/vllm/vllm/v1/core/block_masking/memento_store.py b/vllm/vllm/v1/core/block_masking/memento_store.py
 new file mode 100644
-index 0000000..cfefa78
+index 0000000..b7201ba
 --- /dev/null
 +++ b/vllm/vllm/v1/core/block_masking/memento_store.py
-@@ -0,0 +1,474 @@
+@@ -0,0 +1,535 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""
@@ -189,6 +189,67 @@ index 0000000..cfefa78
 +    return os.environ.get(
 +        "PAPER2_RECALL_QUEUE_PATH", _RECALL_QUEUE_PATH_DEFAULT
 +    )
++
++
++_CAPTURED_OBS_PATH_DEFAULT = "/tmp/paper2_captured_obs.jsonl"
++
++
++def _captured_obs_path() -> str:
++    return os.environ.get(
++        "PAPER2_CAPTURED_OBS_PATH", _CAPTURED_OBS_PATH_DEFAULT
++    )
++
++
++def announce_captured_obs(obs_id: str) -> None:
++    """Phase 9: engine-side notice that obs_id is now in the memento store.
++
++    Append-only file; adapter reads it (read_captured_obs_ids) before
++    queuing kvrestore recalls so we never recall an obs the engine
++    hasn't captured yet (which would fail with 'unknown memento_id').
++    """
++    path = _captured_obs_path()
++    try:
++        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
++        with open(path, "a") as f:
++            f.write(json.dumps({"obs_id": obs_id}) + "\n")
++    except Exception:
++        pass
++
++
++def read_captured_obs_ids() -> "set[str]":
++    """Phase 9: snapshot of obs_ids the engine has captured this session.
++
++    Adapter calls this before deciding whether to recall a given obs_id.
++    Idempotent and cheap (small append-only file). Returns an empty set
++    if the file doesn't exist yet.
++    """
++    path = _captured_obs_path()
++    if not os.path.exists(path):
++        return set()
++    out: "set[str]" = set()
++    try:
++        with open(path) as f:
++            for line in f:
++                try:
++                    rec = json.loads(line)
++                except Exception:
++                    continue
++                oid = rec.get("obs_id")
++                if oid:
++                    out.add(oid)
++    except Exception:
++        return out
++    return out
++
++
++def reset_captured_obs() -> None:
++    """Test hook: reset the captured-obs announcement file."""
++    path = _captured_obs_path()
++    if os.path.exists(path):
++        try:
++            os.remove(path)
++        except Exception:
++            pass
 +
 +
 +def queue_recall(obs_id: str) -> None:
@@ -1585,7 +1646,7 @@ index 09302a7..3400f96 100644
      def from_engine_core_request(
          cls,
 diff --git a/vllm/vllm/v1/worker/gpu_model_runner.py b/vllm/vllm/v1/worker/gpu_model_runner.py
-index f677b37..02eb4a7 100644
+index f677b37..b8964dc 100644
 --- a/vllm/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/vllm/v1/worker/gpu_model_runner.py
 @@ -866,6 +866,29 @@ class GPUModelRunner(
@@ -1669,7 +1730,7 @@ index f677b37..02eb4a7 100644
          # Wait until valid_sampled_tokens_count is copied to cpu,
          # then use it to update actual num_computed_tokens of each request.
          valid_sampled_token_count = self._get_valid_sampled_token_count()
-@@ -1041,6 +1108,330 @@ class GPUModelRunner(
+@@ -1041,6 +1108,338 @@ class GPUModelRunner(
          # Refresh batch metadata with any pending updates.
          self.input_batch.refresh_metadata()
  
@@ -1762,6 +1823,14 @@ index f677b37..02eb4a7 100644
 +                    cpu_kv=cpu_kv,
 +                )
 +                store.stash(memento)
++                # Phase 9: announce capture so adapter can gate recalls.
++                try:
++                    from vllm.v1.core.block_masking.memento_store import (
++                        announce_captured_obs as _announce,
++                    )
++                    _announce(op.memento_id)
++                except Exception:
++                    pass
 +                print(f"[v3-capture]   stashed {op.memento_id}  "
 +                      f"blocks={len(src_block_ids)}  bytes={memento.cpu_bytes()}  "
 +                      f"store_total={store.total_cpu_bytes()}", flush=True)

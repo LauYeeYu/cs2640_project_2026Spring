@@ -417,17 +417,35 @@ class MementoPolicy(CompactionPolicy):
             # the runner. delta_tokens = m_obs - p_memento_placeholder; this
             # is the suffix shift the rotation kernel must correct so RoPE
             # phase matches the new logical positions (no re-prefill).
+            #
+            # Phase 9: the engine captures asynchronously w.r.t. the policy
+            # (one obs per chat in markers-always-on mode). If we recall
+            # an obs the engine hasn't captured yet, the splice fails AND
+            # we've cleared msg.memento — leaving the msg neither memento'd
+            # nor restorable. Check captured-obs set up front; if not yet
+            # captured, leave the memento intact and skip this recall.
             obs = msg.get("content") or ""
             memento_text = msg.get("memento") or ""
             if obs:
-                # Tokenize both with ctx.tokenizer to get accurate counts.
-                # The "memento placeholder" rendered into the prompt during
-                # the compacted period is `[tool_response, evicted, memento]\n{memento}`
-                # — a small wrapper plus the memento body. We approximate the
-                # placeholder length as len(memento) tokens since the wrapper
-                # is fixed across compaction events; the precise wrapper
-                # length only matters if it shifts the suffix by more than
-                # block_size, which is unlikely (the wrapper is ~5 tokens).
+                # Compute obs_id and check engine has captured it.
+                try:
+                    from vllm.v1.core.block_masking import compute_obs_id
+                    from vllm.v1.core.block_masking.memento_store import (
+                        read_captured_obs_ids,
+                    )
+                    wrapped = f"<tool_response>\n{obs}\n</tool_response>"
+                    obs_token_ids = ctx.tokenizer.encode(wrapped)
+                    expected_obs_id = (
+                        compute_obs_id(obs_token_ids) if obs_token_ids else None
+                    )
+                    captured = read_captured_obs_ids()
+                except Exception:
+                    expected_obs_id = None
+                    captured = set()
+                if expected_obs_id and expected_obs_id not in captured:
+                    # Engine hasn't captured this obs yet; skip recall to
+                    # avoid losing the memento. Try again next step.
+                    return messages, None
                 m_obs = ctx.tokenizer.count(obs)
                 p_placeholder = ctx.tokenizer.count(memento_text)
                 delta = m_obs - p_placeholder

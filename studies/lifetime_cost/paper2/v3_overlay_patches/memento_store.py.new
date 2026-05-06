@@ -106,6 +106,67 @@ def _recall_queue_path() -> str:
     )
 
 
+_CAPTURED_OBS_PATH_DEFAULT = "/tmp/paper2_captured_obs.jsonl"
+
+
+def _captured_obs_path() -> str:
+    return os.environ.get(
+        "PAPER2_CAPTURED_OBS_PATH", _CAPTURED_OBS_PATH_DEFAULT
+    )
+
+
+def announce_captured_obs(obs_id: str) -> None:
+    """Phase 9: engine-side notice that obs_id is now in the memento store.
+
+    Append-only file; adapter reads it (read_captured_obs_ids) before
+    queuing kvrestore recalls so we never recall an obs the engine
+    hasn't captured yet (which would fail with 'unknown memento_id').
+    """
+    path = _captured_obs_path()
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps({"obs_id": obs_id}) + "\n")
+    except Exception:
+        pass
+
+
+def read_captured_obs_ids() -> "set[str]":
+    """Phase 9: snapshot of obs_ids the engine has captured this session.
+
+    Adapter calls this before deciding whether to recall a given obs_id.
+    Idempotent and cheap (small append-only file). Returns an empty set
+    if the file doesn't exist yet.
+    """
+    path = _captured_obs_path()
+    if not os.path.exists(path):
+        return set()
+    out: "set[str]" = set()
+    try:
+        with open(path) as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                oid = rec.get("obs_id")
+                if oid:
+                    out.add(oid)
+    except Exception:
+        return out
+    return out
+
+
+def reset_captured_obs() -> None:
+    """Test hook: reset the captured-obs announcement file."""
+    path = _captured_obs_path()
+    if os.path.exists(path):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+
 def queue_recall(obs_id: str) -> None:
     """Append obs_id to the recall queue file.
 

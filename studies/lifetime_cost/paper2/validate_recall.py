@@ -177,8 +177,12 @@ def _run(task, model, *, variant: str, seed: int = 0):
     # global file shared across the engine subprocess and the main proc; we
     # don't want hashes from a previous task accidentally matching here.
     try:
-        from vllm.v1.core.block_masking.memento_store import reset_recall_queue
+        from vllm.v1.core.block_masking.memento_store import (
+            reset_recall_queue,
+            reset_captured_obs,
+        )
         reset_recall_queue()
+        reset_captured_obs()
     except Exception:
         pass
 

@@ -172,6 +172,7 @@ class MementoVLLMModel(ChatModel):
             from vllm.v1.core.block_masking import compute_obs_id
             from vllm.v1.core.block_masking.memento_store import (
                 queue_kv_restore_request,
+                read_captured_obs_ids,
             )
         except Exception:
             return None
@@ -180,6 +181,16 @@ class MementoVLLMModel(ChatModel):
         if not token_ids:
             return None
         obs_id = compute_obs_id(token_ids)
+        # Phase 9: only queue recall for obs the engine has already captured.
+        # The engine appends to a shared file (announce_captured_obs) on
+        # every successful stash. If the obs isn't there yet, the recall
+        # would fail with 'unknown memento_id' anyway — skip it.
+        captured = read_captured_obs_ids()
+        if obs_id not in captured:
+            print(f"[v3c-adapter-kv-restore-skip] obs_id={obs_id} not yet "
+                  f"captured (store has {len(captured)} obs); skipping recall",
+                  flush=True)
+            return None
         print(f"[v3c-adapter-kv-restore] len={len(token_ids)} first={token_ids[:3]} "
               f"last={token_ids[-3:]} delta={rotate_delta} → {obs_id}",
               flush=True)
