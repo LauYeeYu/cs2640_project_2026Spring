@@ -703,7 +703,7 @@ index db7a4d2..c703037 100644
      # block masking compactions. These requests will do prefill only,
      # allowing compaction to run before the first decode token.
 diff --git a/vllm/vllm/v1/core/sched/scheduler.py b/vllm/vllm/v1/core/sched/scheduler.py
-index 6b0d8fe..b43716f 100644
+index 6b0d8fe..185d75e 100644
 --- a/vllm/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/vllm/v1/core/sched/scheduler.py
 @@ -185,10 +185,37 @@ class Scheduler(SchedulerInterface):
@@ -1140,7 +1140,7 @@ index 6b0d8fe..b43716f 100644
 +        insert_block_idx = m.logical_range[0] // block_size
 +        spliced_into = []
 +        suffix_block_ids_pre_splice: list[int] = []
-+        for mgr in self.kv_cache_manager._coordinator.single_type_managers:
++        for mgr in self.kv_cache_manager.coordinator.single_type_managers:
 +            req_blocks = mgr.req_to_blocks.get(request_id)
 +            if req_blocks is None:
 +                continue
