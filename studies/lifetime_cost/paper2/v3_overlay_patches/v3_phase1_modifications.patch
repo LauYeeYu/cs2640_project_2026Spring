@@ -946,7 +946,7 @@ index db7a4d2..c703037 100644
      # block masking compactions. These requests will do prefill only,
      # allowing compaction to run before the first decode token.
 diff --git a/vllm/vllm/v1/core/sched/scheduler.py b/vllm/vllm/v1/core/sched/scheduler.py
-index 6b0d8fe..abb55e8 100644
+index 6b0d8fe..466773b 100644
 --- a/vllm/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/vllm/v1/core/sched/scheduler.py
 @@ -88,6 +88,16 @@ class Scheduler(SchedulerInterface):
@@ -1215,7 +1215,7 @@ index 6b0d8fe..abb55e8 100644
          
          if self.log_stats:
              request.record_event(EngineCoreEventType.QUEUED)
-@@ -1759,11 +1920,360 @@ class Scheduler(SchedulerInterface):
+@@ -1759,11 +1920,453 @@ class Scheduler(SchedulerInterface):
                  merged.append((start, end))
          return merged
  
@@ -1379,6 +1379,80 @@ index 6b0d8fe..abb55e8 100644
 +                  f"recall chain hashes ({len(pending)} pairs processed)",
 +                  flush=True)
 +
++    def _dual_key_after_recall_splice(
++        self,
++        request_id: str,
++        insert_block_idx: int,
++        n_obs_blocks: int,
++    ) -> None:
++        """Phase 8 dual-key insert at recall time (paired with Phase 9 rotation).
++
++        Computes recall-prompt chain hashes from request.all_token_ids
++        (which now reflects the post-recall layout — obs restored at the
++        original position) and inserts each spliced obs block + each
++        suffix block under that chain hash. The OLD chain hash entries
++        (from the compacted period) are left intact: per Vlad's
++        directive, we never invalidate the cache.
++
++        Effect: future requests with the recall-layout chain hash will
++        find these blocks. Their K is at the recall RoPE phase (after
++        the rotation that runs in this same chat's worker step), so
++        attention reads correct K.
++        """
++        from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
++
++        request = self.requests.get(request_id)
++        if request is None:
++            return
++        # Walk the recall prompt's tokens block-by-block.
++        token_ids = list(request.all_token_ids[: request.num_prompt_tokens])
++        chain_hashes = self._compute_chain_hashes(token_ids)
++        if not chain_hashes:
++            return
++
++        block_pool = self.kv_cache_manager.block_pool
++        try:
++            kv_groups = self.kv_cache_config.kv_cache_groups
++        except Exception:
++            kv_groups = []
++        group_ids = list(range(max(1, len(kv_groups)))) if kv_groups else [0]
++
++        n_inserts = 0
++        # Iterate every per-group block table; insert each block in the
++        # affected range (obs region + suffix) under the recall chain hash.
++        for mgr in self.kv_cache_manager.coordinator.single_type_managers:
++            req_blocks = mgr.req_to_blocks.get(request_id)
++            if req_blocks is None:
++                continue
++            # Block indices [insert_block_idx, end] are: obs (n_obs blocks)
++            # + suffix. We dual-key all of them.
++            start = insert_block_idx
++            end = len(req_blocks)
++            for blk_idx in range(start, end):
++                if blk_idx >= len(chain_hashes):
++                    break
++                blk = req_blocks[blk_idx]
++                if blk is None:
++                    continue
++                chain_hash = chain_hashes[blk_idx]
++                gid = mgr.kv_cache_group_id
++                key = make_block_hash_with_group_id(chain_hash, gid)
++                # Don't double-insert if already present.
++                if block_pool.cached_block_hash_to_block.get_one_block(key) is not None:
++                    continue
++                block_pool.cached_block_hash_to_block.insert(key, blk)
++                n_inserts += 1
++        if n_inserts:
++            try:
++                from vllm.v1.core.block_masking.memento_store import bump as _bump
++                _bump("dual_key_inserts", n_inserts)
++            except Exception:
++                pass
++            print(f"[v8-dual-key-on-recall] request_id={request_id} "
++                  f"inserted {n_inserts} blocks under recall chain hashes "
++                  f"(insert_idx={insert_block_idx}, n_obs={n_obs_blocks})",
++                  flush=True)
++
 +    def queue_kv_restore(
 +        self,
 +        request_id: str,
@@ -1524,6 +1598,25 @@ index 6b0d8fe..abb55e8 100644
 +            except Exception as e:
 +                print(f"[v9-rotate-err] {type(e).__name__}: {e}", flush=True)
 +
++            # Phase 8 dual-key INSERT: after splice + (upcoming) rotation,
++            # the suffix blocks' K is at the recall-prompt RoPE phase. We
++            # insert them into cached_block_hash_to_block under the recall-
++            # prompt's chain hash so future requests' prefix-cache walk
++            # finds them via the new chain. The OLD entries (compacted-
++            # period chain) STAY — Vlad's directive: never invalidate the
++            # cache. Future requests matching the old chain still get
++            # these blocks; their K is now mis-phased but that's a
++            # correctness trade we accept.
++            try:
++                self._dual_key_after_recall_splice(
++                    request_id=request_id,
++                    insert_block_idx=insert_block_idx,
++                    n_obs_blocks=n_blocks,
++                )
++            except Exception as e:
++                print(f"[v8-dual-key-on-recall-err] "
++                      f"{type(e).__name__}: {e}", flush=True)
++
 +        return True, (f"queued restore + spliced: {n_blocks} blocks at "
 +                      f"block_idx={insert_block_idx} → "
 +                      f"target_block_ids={target_block_ids}"
@@ -1576,7 +1669,7 @@ index 6b0d8fe..abb55e8 100644
      ) -> SpanRemovalResult:
          """Mask a span of tokens and compact the KV cache in one step.
  
-@@ -1776,6 +2286,11 @@ class Scheduler(SchedulerInterface):
+@@ -1776,6 +2379,11 @@ class Scheduler(SchedulerInterface):
              request_id: The request ID.
              start_position: Start logical position (inclusive).
              end_position: End logical position (exclusive).
@@ -1588,7 +1681,7 @@ index 6b0d8fe..abb55e8 100644
  
          Returns:
              SpanRemovalResult with success status, tokens removed, and
-@@ -1808,6 +2323,10 @@ class Scheduler(SchedulerInterface):
+@@ -1808,6 +2416,10 @@ class Scheduler(SchedulerInterface):
              )
  
          if end_position > request.num_computed_tokens:
@@ -1599,7 +1692,7 @@ index 6b0d8fe..abb55e8 100644
              return SpanRemovalResult(
                  success=False,
                  tokens_removed=0,
-@@ -1839,6 +2358,10 @@ class Scheduler(SchedulerInterface):
+@@ -1839,6 +2451,10 @@ class Scheduler(SchedulerInterface):
              active_logical.extend(range(prev_end, num_computed))
  
          if not active_logical:
@@ -1610,7 +1703,7 @@ index 6b0d8fe..abb55e8 100644
              return SpanRemovalResult(
                  success=False,
                  tokens_removed=0,
-@@ -1854,20 +2377,121 @@ class Scheduler(SchedulerInterface):
+@@ -1854,20 +2470,121 @@ class Scheduler(SchedulerInterface):
              request.logical_to_physical(p) for p in active_logical
          ]
  
