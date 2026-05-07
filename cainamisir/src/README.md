@@ -32,8 +32,9 @@ git checkout paper2-memento-recall   # Paper 2
 
 ## Build / run
 
-The top-level `README.md` of the source repo (the
-`paper2-memento-recall` branch has the most up-to-date version) covers:
+See [`adaptivecache_paper2/README.md`](adaptivecache_paper2/README.md)
+in this folder — the most up-to-date project README, taken from the
+`paper2-memento-recall` branch. It covers:
 
 - Paper 1 SWE-bench Lite live + τ-bench retail bake commands
   (`scripts/run_experiment_matrix.py`, `scripts/run_swebench.py`)

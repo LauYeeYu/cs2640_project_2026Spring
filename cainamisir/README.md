@@ -80,8 +80,10 @@ on the path (bundled in the repository this folder was authored in).
 
 ### Reproducing the experiments
 
-See the project README at
-<https://github.com/cainamisir/adaptivecache#readme>. It covers:
+See the in-repo project README at
+[`src/adaptivecache_paper2/README.md`](src/adaptivecache_paper2/README.md)
+(the most up-to-date version, on the `paper2-memento-recall` branch).
+It covers:
 
 - Paper 1 SWE-bench Lite live + τ-bench retail bake commands
 - Paper 2 Modal H100 launch commands for `validate_recall.py` and the
